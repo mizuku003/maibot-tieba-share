@@ -529,6 +529,10 @@ class StoneThread:
     # 页面结构变了就都是 0，筛选端要把它当成「不知道」而不是「零赞」。
     agree: int = 0
     views: int = 0
+    # 精品帖标记与发帖时间戳。HTML 列表页也能看出精品（ti_title 旁边的小图标），
+    # protobuf 路线直接有布尔字段，两条路都填得上。
+    is_good: bool = False
+    create_time: int = 0
 
     @property
     def has_video(self) -> bool:
@@ -559,6 +563,9 @@ class StoneFloor:
     # 楼中楼：页面只渲染前几条，comment_total 是真实总数（data-list-count）。
     comments: list[StoneComment] = field(default_factory=list)
     comment_total: int = 0
+    # 这一层自己的点赞数。HTML 页面给不了（实测 55 个样本里 agree/zan/j_agree
+    # 命中数全是 0），只有 protobuf 路线有；HTML 路线留 0。
+    agree: int = 0
 
 
 @dataclass
@@ -570,6 +577,9 @@ class StoneDetail:
     blocked: bool = False
     # 页面原文：「贴吧原页面」长图模式下直接把这份 HTML 交给渲染器
     raw: str = ""
+    # protobuf 路线额外拿到的帖子级信息（标题/回复数/点赞数/总页数…）。
+    # HTML 路线留空 —— 那边这些数在 StoneThread 上已经有了。
+    info: dict[str, Any] = field(default_factory=dict)
 
     @property
     def images(self) -> list[str]:
@@ -926,7 +936,11 @@ class StoneTiebaClient:
         delay_seconds: float = 3.0,
         retries: int = 2,
         user_agent: str = "",
+        shared_block: Any = None,
     ) -> None:
+        # 反爬冷却可以跟别的客户端共用一份。分开记的话，一个接口被拦了，
+        # 另一个还当自己没事继续敲，只会把封禁拖得更久。
+        self._shared_block = shared_block
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
         self.delay_seconds = max(0.0, float(delay_seconds))
@@ -961,12 +975,17 @@ class StoneTiebaClient:
 
     def blocked_remaining(self) -> float:
         """还在冷却期里就返回剩余秒数，否则 0。"""
+        if self._shared_block is not None:
+            return float(self._shared_block.remaining())
         if not self._blocked_at:
             return 0.0
         left = BLOCK_COOLDOWN_SECONDS - (time.monotonic() - self._blocked_at)
         return left if left > 0 else 0.0
 
     def _mark_blocked(self) -> None:
+        if self._shared_block is not None:
+            self._shared_block.mark()
+            return
         self._blocked_at = time.monotonic()
 
     def reset_block(self) -> None:
@@ -975,6 +994,8 @@ class StoneTiebaClient:
         只清冷却、不动搬运记录：记录是「搬过什么」，冷却是「被贴吧拦了多久」，
         两者互不相干，混在一起清会让用户为了解封而丢掉去重记录。
         """
+        if self._shared_block is not None:
+            self._shared_block.clear()
         self._blocked_at = 0.0
 
     async def _seed_guest_cookie(self) -> None:

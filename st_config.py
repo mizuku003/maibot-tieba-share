@@ -46,7 +46,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.0.4",
+        default="1.0.5",
         description="配置版本号，请勿手动修改",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
@@ -197,6 +197,26 @@ class ScheduleSection(PluginConfigBase):
             "hint": "提前多少秒开始取帖，到点准时发出",
         },
     )
+    # 用 Literal 而不是自己往 json_schema_extra 里塞 choices：
+    # SDK 的 _extract_select_choices 只认 Literal 注解
+    # （maibot_sdk/config.py:446），手写的 choices 面板根本不看。
+    group_mode: Literal["allow", "deny"] = Field(
+        default="allow",
+        description="群名单模式：allow = 只发名单里的群，deny = 名单里的群不发",
+        json_schema_extra={
+            "label": "群名单模式",
+            "hint": "白名单：只在下面列的群里发；黑名单：下面列的群不发。默认白名单且名单为空 = 哪个群都不发",
+            "x-widget": "select",
+        },
+    )
+    group_list: list[str] = Field(
+        default_factory=list,
+        description="群名单（填群号，一行一个）",
+        json_schema_extra={
+            "label": "群名单",
+            "hint": "白名单模式下只有这些群会收到；黑名单模式下这些群不收。填群号，一行一个",
+        },
+    )
     daily_times: list[str] = Field(
         default_factory=list,
         description="每天几点搬（24 小时制，一行一个）",
@@ -221,6 +241,7 @@ class ScheduleSection(PluginConfigBase):
             "hint": "格式 HH:MM；支持跨午夜。默认 23:00~08:00 深夜不发",
         },
     )
+
 
 
 class SendSection(PluginConfigBase):
@@ -325,16 +346,6 @@ class SendSection(PluginConfigBase):
         description="长图宽度（像素）",
         json_schema_extra={"label": "长图宽度", "hint": "只对「自绘卡片」有效"},
     )
-    include_groups: list[str] = Field(
-        default_factory=list,
-        description="只往这些群发（填群号，一行一个）",
-        json_schema_extra={"label": "只发这些群", "hint": "只往这些群发，填群号；留空 = 不限"},
-    )
-    exclude_groups: list[str] = Field(
-        default_factory=list,
-        description="这些群不发（填群号，一行一个）",
-        json_schema_extra={"label": "这些群不发", "hint": "这些群不发，优先于上面的名单"},
-    )
 
 
 class FetchSection(PluginConfigBase):
@@ -413,15 +424,15 @@ class AdminSection(PluginConfigBase):
         description="管理员的 QQ 号（一行一个）",
         json_schema_extra={
             "label": "管理员",
-            "hint": "能用维护命令的 QQ 号，一行一个",
+            "hint": "能用全部命令的 QQ 号，一行一个",
         },
     )
     allow_groups: list[str] = Field(
         default_factory=list,
-        description="允许用维护命令的群（一行一个群号）",
+        description="能用搬石指令的群（一行一个群号）",
         json_schema_extra={
-            "label": "管理员群",
-            "hint": "这些群里谁都能用维护命令；一行一个群号",
+            "label": "可搬石的群",
+            "hint": "这些群里任何人都能用 /搬石；一行一个群号",
         },
     )
 
@@ -516,10 +527,49 @@ _DEFAULT_MIGRATIONS: dict[tuple[str, str], tuple[object, object]] = {
 }
 
 
+# 群名单从「一份白名单 + 一份黑名单」改成了「模式 + 一份名单」。老配置要能平滑
+# 搬过来，否则用户升级完发现「明明配了群，却一个都不发」。两条旧名单的语义决定
+# 了怎么合：填过白名单的按白名单搬；只填了黑名单的按黑名单搬；两边都填过时以
+# 黑名单为准（原来的代码里黑名单优先级更高，保持这个语义）。
+_GROUP_MOVES: dict[str, str] = {
+    "include_groups": "allow",
+    "exclude_groups": "deny",
+}
+
+
 def migrate_config(raw: dict) -> bool:
-    """把老配置里「没动过、但默认值已经变了」的字段换成新默认，返回是否改过。"""
+    """把老配置里「没动过、但默认值已经变了」的字段换成新默认，返回是否改过。
+
+    顺带把换过节、挪过位置的字段搬到新位置；用户填的值原样跟随。
+    """
 
     changed = False
+    # 群名单：先在旧位置（send）和新位置（schedule）里把两条老名单都翻出来。
+    old_mode = ""
+    old_list: list[Any] = []
+    for block_name in ("send", "schedule"):
+        block = raw.get(block_name)
+        if not isinstance(block, dict):
+            continue
+        for field, mode in _GROUP_MOVES.items():
+            if field not in block:
+                continue
+            value = block.pop(field)
+            changed = True
+            items = [x for x in value if str(x or "").strip()] if isinstance(value, list) else []
+            if items:
+                # 黑名单最后处理，于是「两边都填过」时它胜出，跟旧代码的优先级一致。
+                old_mode = mode
+                old_list = items
+    if old_mode:
+        schedule_block = raw.get("schedule")
+        if not isinstance(schedule_block, dict):
+            raw["schedule"] = schedule_block = {}
+        if not schedule_block.get("group_list"):
+            schedule_block["group_list"] = old_list
+        if not str(schedule_block.get("group_mode") or "").strip():
+            schedule_block["group_mode"] = old_mode
+        changed = True
     for (section, field), (old_default, new_default) in _DEFAULT_MIGRATIONS.items():
         block = raw.get(section)
         if not isinstance(block, dict) or field not in block:

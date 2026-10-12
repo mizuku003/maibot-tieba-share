@@ -20,6 +20,7 @@ import asyncio
 import base64
 import io
 import json as _json
+import random
 import re
 import sys as _sys
 import time
@@ -78,6 +79,7 @@ from st_card import build_thread_html, build_thread_text, image_data_uri  # noqa
 from st_config import StoneConfig, in_quiet_hours, migrate_config, resolve_forums  # noqa: E402
 from st_page import build_page_html, placeholder_urls  # noqa: E402
 from st_store import StoneStore  # noqa: E402
+from st_fetch import BlockState, StoneProtoClient, thread_from_proto  # noqa: E402
 from st_tieba import (  # noqa: E402
     StoneBlockedError,
     StoneTiebaClient,
@@ -110,6 +112,32 @@ _VIDEO_SEND_TIMEOUT_MS = 300_000
 # 同样得显式加时。少了它，一次慢转发会被判超时抛异常，走进 `if not sent` 那条
 # 降级分支把视频再发一遍，群里就多出一份。
 _FORWARD_TIMEOUT_MS = 300_000
+
+# -- 发送失败重试 ----------------------------------------------------------
+#
+# 宿主的发送能力（`cap.call`）只要拿到返回值就算成功，它并不会告诉我们协议端
+# 有没有真的把消息投出去：签名过期、`401`、适配器拒收，在插件看起来都和成功
+# 一样。能观察到的失败只有两类 —— 抛异常（RPC 层断了、超时）和返回 None。
+# 这两类都值得再试一次：RPC 层偶发抖动的概率远高于「内容本身发不出去」。
+#
+# 但不能无限试：一轮搬运要发几十上百条，条条重试会把整轮的耗时翻几倍，
+# 而且真有结构性问题时（比如目标群被解散）重试一万次也没用。所以给三次。
+_SEND_RETRY_TIMES = 3
+# 两次重试之间等多久。**指数退避**：RPC 抖动通常几十毫秒就过去了，
+# 等 1 秒足够；真遇上宿主忙，2 秒、4 秒给足它缓过来。
+_SEND_RETRY_BASE_S = 1.0
+
+# -- 发送令牌桶 ------------------------------------------------------------
+#
+# 一轮搬运会连续发几十条消息，中间**一条都不歇**。QQ 服务端对此有频率限制，
+# 发太快会被临时拒收 —— 而拒收在插件看来等于「发送成功」（见上），
+# 于是消息静默丢失、用户只收到半批。
+#
+# 令牌桶按「每秒补几个令牌」限速，桶容量允许短时突发（首帖要秒发，
+# 不能因为限速让用户等）。默认 1.5 个/秒、桶容量 5 —— 实测一轮 5 帖
+# x 十几条消息不会被拒，同时也远没慢到用户能察觉。
+_SEND_RATE_PER_SECOND = 1.5
+_SEND_BURST = 5.0
 # 一条合并转发是一个 RPC 帧，上限 16MB（host transport/base.py 的 MAX_FRAME_SIZE）。
 #
 # 算这个预算必须知道两件事，都跟直觉不一样：
@@ -220,27 +248,20 @@ _PAGE_CACHE_CLEAN_DELAY_S = 600.0
 # 改成每隔这么多秒最多真正扫一次目录。
 _PAGE_CACHE_PRUNE_INTERVAL_S = 30.0
 
-# 维护类子命令的拒绝文案，只放管理员
-_MAINTENANCE_DENIED = (
-    "这条命令只有管理员能用（会立刻往群里发消息、或改动搬运记录）。\n"
-    "让管理员在插件设置 →「权限 · 管理员」里加上你的 QQ 号，"
-    "或者直接用主程序终端发这条命令。"
-)
+# 没权限时的回复。两类命令各一句：搬石类群里可用，维护类只放管理员。
+_MOVE_DENIED = "你没有使用此命令的权限。"
+_MAINTENANCE_DENIED = "你没有使用此命令的权限（仅管理员）。"
 
 _HELP_TEXT = "\n".join(
     [
-        "麦麦贴吧搬石 · 用法",
-        "/搬石　　　　　　管理员：按配置搬一轮，发到当前群",
-        "/搬视频　　　　　管理员：只搬视频帖",
-        "/搬石 状态　　　看每个吧搬了多少、最后一次是什么时候（管理员）",
-        "/搬石 重置 [吧]　清空搬运记录，下次会重新搬（管理员）",
-        "/搬石 重置 冷却　解除反爬冷却，不影响搬运记录（管理员）",
-        "/搬石 帮助　　　这条说明",
+        "麦麦贴吧搬石",
         "",
-        "",
-        "自动搬石在插件配置里开：选要逛的吧、定时（隔多久或每天定点）、",
-        "发哪些群、要「文本 + 图片」还是「一张长图」、要不要打包成聊天记录。",
-        "谁能用维护命令在插件配置 →「权限」里配，管理员直接填 QQ 号。",
+        "/搬石　　　　　　按配置搬一轮",
+        "/搬视频　　　　只搬视频帖",
+        "/搬石 状态　　看每个吧搬了多少",
+        "/搬石 重置 [吧]　清空搬运记录",
+        "/搬石 重置 冷却　解除反爬冷却",
+        "/搬石 帮助　　这条说明",
     ]
 )
 
@@ -308,6 +329,12 @@ def _admin_ids(values: Any) -> set[str]:
         )
         found.update(_DIGITS_RE.findall(text))
     return found
+
+
+# 群名单的两种模式。默认白名单，且默认名单为空 —— 也就是**默认哪个群都不发**，
+# 要用户自己把群号填进来才开始工作。
+_GROUP_ALLOW = "allow"
+_GROUP_DENY = "deny"
 
 
 def _group_set(values: Any) -> set[str]:
@@ -499,6 +526,95 @@ class _ToolOptions:
         return getattr(send, name)
 
 
+class _SendGate:
+    """发送侧的令牌桶 + 失败重试。
+
+    职责单一：把「发一条消息」包成「限速地发、失败了退避重试几次」。
+    插件里有四类发送（文字、图片、custom 段、合并转发），各有各的签名，
+    所以这里不接具体发送函数，只提供 wait 和 run：
+
+    * wait —— 从桶里取一个令牌，取不到就睡到有为止；
+    * run —— 调一次真的发送，抛异常或返回 None 就退避重试。
+
+    **为什么返回 None 也算失败**：宿主的 cap.call 拿不到返回值时
+    sent_message is not None 为假，能力层把它报成失败；而 False 是
+    「确实发了、但没拿到消息 id」，不算失败 —— 这两者不能混为一谈，
+    混了就会把已经发出去的消息再发一遍。所以判定写 ok is None。
+    """
+
+    __slots__ = ("_tokens", "_at", "_rate", "_burst", "_retries", "_base")
+
+    def __init__(
+        self,
+        *,
+        rate: float = _SEND_RATE_PER_SECOND,
+        burst: float = _SEND_BURST,
+        retries: int = _SEND_RETRY_TIMES,
+        base_delay: float = _SEND_RETRY_BASE_S,
+    ) -> None:
+        self._rate = max(0.01, float(rate))
+        self._burst = max(1.0, float(burst))
+        self._tokens = self._burst
+        self._at = time.monotonic()
+        self._retries = max(0, int(retries))
+        self._base = max(0.0, float(base_delay))
+
+    async def wait(self) -> None:
+        """取一个令牌；桶空就睡到下一个令牌补上。"""
+        while True:
+            now = time.monotonic()
+            self._tokens = min(self._burst, self._tokens + (now - self._at) * self._rate)
+            self._at = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            await asyncio.sleep((1.0 - self._tokens) / self._rate)
+
+    async def run(self, send: Any, *args: Any, **kwargs: Any) -> bool:
+        """限速发一条消息，失败退避重试。返回是否发出去了。
+
+        **什么算失败**：SDK 把发送能力的返回值归一成 ``bool``
+        （``maibot_sdk/context.py:294``，``send.text``/``send.image``/``send.custom``/
+        ``send.forward`` 都在 ``_BOOLEAN_SUCCESS_CAPABILITIES`` 里），
+        依据是宿主 ``_build_send_result`` 的 ``success = sent_message is not None``。
+        所以：
+
+        * ``True``  —— 发出去了；
+        * ``False`` —— **宿主明确说没发成**（缺参数、抛异常、平台拒绝），要重试；
+        * ``None``  —— 理论上不该出现（能力没被归一），按失败处理。
+
+        以前这里写的是 ``ok is not None``，等于把 ``False`` 当成成功，
+        「发失败就退而发链接」的兜底逻辑整个失效 —— 用户看到的是视频凭空消失。
+        网关/适配器临时抽风返回 False 时重试一次往往就好了，这也是要重试的理由。
+
+        Args:
+            send: 真的发送函数（self.ctx.send.text 之类）。
+            *args: 原样转给 send。
+            **kwargs: 原样转给 send。
+
+        Returns:
+            发出去了是 True；重试用光还是没发成是 False。
+        """
+        for attempt in range(self._retries + 1):
+            await self.wait()
+            try:
+                ok = await send(*args, **kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                # 异常不往上抛：一轮搬运几十条消息，一条发不出去
+                # 不该让整轮崩掉、把后面的帖子全丢了。
+                ok = False
+            if ok:
+                return True
+            if attempt >= self._retries:
+                return False
+            # 指数退避：1s、2s、4s…，加抖动免得定时任务撞在一起。
+            delay = self._base * (2 ** attempt) * random.uniform(0.8, 1.2)
+            await asyncio.sleep(delay)
+        return False
+
+
 class StonePlugin(MaiBotPlugin):
     """麦麦贴吧搬石插件。"""
 
@@ -508,6 +624,12 @@ class StonePlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._client: StoneTiebaClient | None = None
+        # protobuf 抓取层：跟 HTML 路线并存。它负责 HTML 拿不到的东西 ——
+        # 帖子点赞数、真翻页、楼中楼正文。
+        self._proto: StoneProtoClient | None = None
+        self._block: BlockState | None = None
+        # 发送侧的令牌桶 + 重试。所有对外发送都过它，别绕过。
+        self._gate: _SendGate = _SendGate()
         self._store: StoneStore | None = None
         self._task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
@@ -542,6 +664,9 @@ class StonePlugin(MaiBotPlugin):
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._proto is not None:
+            await self._proto.aclose()
+            self._proto = None
         self.ctx.logger.info("[搬石] 已卸载")
 
     def normalize_plugin_config(self, config_data):
@@ -565,6 +690,9 @@ class StonePlugin(MaiBotPlugin):
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
+            if self._proto is not None:
+                await self._proto.aclose()
+                self._proto = None
             self._setup()
             self._maybe_start_loop()
         self.ctx.logger.info("[搬石] 配置已更新（version=%s），运行时已重建", version)
@@ -646,17 +774,37 @@ class StonePlugin(MaiBotPlugin):
 
     def _setup(self) -> None:
         cfg = self.config
+        # 反爬冷却由两个客户端共用：拦的是这台机器，不是某个接口。
+        # 分成两份的话，HTML 那边被拦了，protobuf 这边还会接着敲，越敲越死。
+        block = BlockState()
+        self._block = block
         self._client = StoneTiebaClient(
             timeout=float(cfg.fetch.timeout),
             proxy=str(cfg.fetch.proxy or "").strip(),
             delay_seconds=float(cfg.fetch.delay_seconds),
             retries=2,
             user_agent=str(cfg.fetch.user_agent or "").strip(),
+            shared_block=block,
+        )
+        self._proto = StoneProtoClient(
+            timeout=float(cfg.fetch.timeout),
+            proxy=str(cfg.fetch.proxy or "").strip(),
+            delay_seconds=float(cfg.fetch.delay_seconds),
+            retries=2,
+            shared_block=block,
         )
         self._store = StoneStore(
             self._data_dir() / "moved.json", keep_per_forum=int(cfg.stone.keep_records)
         )
         self._store.load()
+
+    def _gate_of(self) -> _SendGate:
+        """拿发送闸门；懒建是为了让没走 on_load 的测试桩也能用。"""
+        gate = getattr(self, "_gate", None)
+        if gate is None:
+            gate = _SendGate()
+            self._gate = gate
+        return gate
 
     def _mode_label(self) -> str:
         cfg = self.config.send
@@ -983,16 +1131,14 @@ class StonePlugin(MaiBotPlugin):
         collected: list[tuple[Any, Any]] = []
         forum_of: dict[str, str] = {}
         blocked = ""
+        proto = getattr(self, "_proto", None)
         for forum in forums:
-            try:
-                threads = await client.fetch_thread_list(
-                    forum, pages=int(cfg.fetch.max_pages)
-                )
-            except StoneBlockedError as exc:
-                blocked = str(exc)
+            threads, blocked = await self._load_threads(
+                forum, client=client, proto=proto, pages=int(cfg.fetch.max_pages)
+            )
+            if blocked:
                 break
-            except StoneTiebaError as exc:
-                self.ctx.logger.warning("[搬石] %s 的帖子列表没取到：%s", forum, exc)
+            if not threads:
                 continue
             want = int(per_forum) if int(per_forum) > 0 else int(cfg.stone.count_per_forum)
             picks = self._pick_threads(forum, threads, limit=per_forum)
@@ -1003,18 +1149,17 @@ class StonePlugin(MaiBotPlugin):
             for thread in picks:
                 if want > 0 and got >= want:
                     break
-                try:
-                    detail = await client.fetch_thread_detail(
-                        thread,
-                        max_floors=int(cfg.fetch.max_floors),
-                        max_chars=int(cfg.fetch.max_chars),
-                        max_comments=int(getattr(cfg.fetch, "max_comments", 3) or 0),
-                    )
-                except StoneBlockedError as exc:
-                    blocked = str(exc)
+                detail, blocked = await self._load_detail(
+                    thread,
+                    client=client,
+                    proto=proto,
+                    max_floors=int(cfg.fetch.max_floors),
+                    max_chars=int(cfg.fetch.max_chars),
+                    max_comments=int(getattr(cfg.fetch, "max_comments", 3) or 0),
+                )
+                if blocked:
                     break
-                except StoneTiebaError as exc:
-                    self.ctx.logger.warning("[搬石] 帖子 %s 取正文失败：%s", thread.tid, exc)
+                if detail is None:
                     continue
                 if not detail.floors:
                     self.ctx.logger.debug("[搬石] 帖子 %s 没有解析到楼层，跳过", thread.tid)
@@ -1107,6 +1252,134 @@ class StonePlugin(MaiBotPlugin):
             int(left),
         )
         await asyncio.sleep(left)
+
+    async def _load_threads(
+        self,
+        forum: str,
+        *,
+        client: Any,
+        proto: Any,
+        pages: int,
+    ) -> tuple[list[Any], str]:
+        """取一个吧的帖子列表，返回 (帖子, 被拦原因)。
+
+        优先走 protobuf：只有它给点赞数，而「最少点赞数」这项筛选全靠它。
+        protobuf 取不到（网络/结构变动）就退回 HTML 列表页 —— 那条路点赞数恒为 0，
+        `_pick_threads` 见到「整页都是 0」会自动跳过点赞筛选，不会把整吧帖子误杀。
+        """
+        if proto is not None:
+            try:
+                threads = await proto.fetch_thread_list(forum=forum, pages=pages)
+            except StoneBlockedError as exc:
+                return [], str(exc)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning(
+                    "[搬石] %s 的帖子列表（protobuf）没取到，退回网页版：%s", forum, exc
+                )
+            else:
+                if threads:
+                    return threads, ""
+                self.ctx.logger.debug("[搬石] %s 的 protobuf 列表页是空的，退回网页版", forum)
+        try:
+            threads = await client.fetch_thread_list(forum, pages=pages)
+        except StoneBlockedError as exc:
+            return [], str(exc)
+        except StoneTiebaError as exc:
+            self.ctx.logger.warning("[搬石] %s 的帖子列表没取到：%s", forum, exc)
+            return [], ""
+        return list(threads), ""
+
+    async def _load_detail(
+        self,
+        thread: Any,
+        *,
+        client: Any,
+        proto: Any,
+        max_floors: int,
+        max_chars: int,
+        max_comments: int,
+    ) -> tuple[Any | None, str]:
+        """取一个帖子的正文，返回 (详情, 被拦原因)。
+
+        两条路各拿一半，缺一不可：
+
+        - **HTML** 给 ``raw``（页面原文）—— 「贴吧原页面」长图就是把这份 HTML 交给
+          渲染器截的，protobuf 给不了。
+        - **protobuf** 给楼中楼正文、楼层点赞数，以及**真翻页** —— HTML 的 ``kz=``
+          页面只有第一页（``pn=`` 对它无效），所以 ``max_floors`` 超过 30 时只有
+          protobuf 这条能接着往下取。
+
+        两边都失败才算这条帖子失败；只有一边成功就用手上有的那份。
+        """
+        detail = None
+        html_error = ""
+        try:
+            detail = await client.fetch_thread_detail(
+                thread,
+                max_floors=max_floors,
+                max_chars=max_chars,
+                max_comments=max_comments,
+            )
+        except StoneBlockedError as exc:
+            return None, str(exc)
+        except StoneTiebaError as exc:
+            html_error = str(exc)
+
+        if proto is not None:
+            try:
+                proto_detail = await proto.fetch_thread_detail(
+                    thread,
+                    max_floors=max_floors,
+                    max_chars=max_chars,
+                    max_comments=max_comments,
+                )
+            except StoneBlockedError as exc:
+                return None, str(exc)
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning(
+                    "[搬石] 帖子 %s 的正文（protobuf）没取到：%s", thread.tid, exc
+                )
+            else:
+                detail = self._merge_detail(detail, proto_detail)
+
+        if detail is None:
+            self.ctx.logger.warning("[搬石] 帖子 %s 取正文失败：%s", thread.tid, html_error)
+            return None, ""
+        return detail, ""
+
+    @staticmethod
+    def _merge_detail(html_detail: Any, proto_detail: Any) -> Any:
+        """把 protobuf 那份的楼中楼与点赞数补进 HTML 那份。
+
+        HTML 是底子（它带着 ``raw``，长图靠它）；protobuf 只往上补两样：
+        楼中楼（HTML 只渲染前几条，而且拿不到正文）和楼层点赞数（HTML 一个都没有）。
+        按楼层号对齐 —— 两边的楼号都是 1 起算，对不上就按顺序兜底。
+        """
+        if html_detail is None:
+            return proto_detail
+        if proto_detail is None:
+            return html_detail
+        by_fn = {floor.fn: floor for floor in proto_detail.floors if floor.fn}
+        for idx, floor in enumerate(html_detail.floors):
+            other = by_fn.get(floor.fn)
+            if other is None and idx < len(proto_detail.floors):
+                other = proto_detail.floors[idx]
+            if other is None:
+                continue
+            if not floor.comments and other.comments:
+                floor.comments = list(other.comments)
+            if other.comment_total > floor.comment_total:
+                floor.comment_total = other.comment_total
+            if not floor.agree:
+                floor.agree = other.agree
+            if not floor.text and other.text:
+                floor.text = other.text
+        # protobuf 多出来的楼层（HTML 只有第一页）接着补在后面，楼号已经自编对齐过
+        if len(proto_detail.floors) > len(html_detail.floors):
+            html_detail.floors.extend(proto_detail.floors[len(html_detail.floors) :])
+        if not html_detail.info and proto_detail.info:
+            html_detail.info = dict(proto_detail.info)
+        return html_detail
 
     def _filter_mode(self) -> str:
         """当前生效的「只搬哪种帖」：工具调用时是它临时指定的，平时是配置值。"""
@@ -1205,11 +1478,21 @@ class StonePlugin(MaiBotPlugin):
             空串表示问着了、就是没有可发的群 —— 两者要分清楚，
             否则宿主机临时抽风却提示用户「检查群配置」，纯属让人白查。
         """
-        cfg = self.config.send
-        include = {_clean_id(x) for x in cfg.include_groups}
-        include.discard("")
-        exclude = {_clean_id(x) for x in cfg.exclude_groups}
-        exclude.discard("")
+        # 群名单在「定时」一节：它管的是发给谁，不是发出来长什么样。
+        cfg = self.config.schedule
+        mode = str(getattr(cfg, "group_mode", _GROUP_ALLOW) or _GROUP_ALLOW).strip().lower()
+        listed = {_clean_id(x) for x in getattr(cfg, "group_list", None) or []}
+        listed.discard("")
+        if mode == _GROUP_DENY:
+            include: set[str] = set()
+            exclude = listed
+            allow_mode = False
+        else:
+            # 白名单：名单空着就是「哪个群都不发」。这是有意的 —— 默认装好插件
+            # 不该往任何群里发东西，得用户自己把群号填进来才算数。
+            include = listed
+            exclude: set[str] = set()
+            allow_mode = True
         try:
             resp = await self.ctx.chat.get_all_streams(platform="qq")
         except Exception as exc:  # noqa: BLE001
@@ -1242,8 +1525,10 @@ class StonePlugin(MaiBotPlugin):
                 continue
             if group_id and group_id in exclude:
                 continue
-            if include and (not group_id or group_id not in include):
-                # 配了白名单但这条会话认不出群号：宁可不发，也不要发错群
+            if allow_mode and (not group_id or group_id not in include):
+                # 白名单模式下要么认不出群号、要么不在名单里，一律不发 ——
+                # 宁可不发，也不要发错群。注意这里**不能**先判 include 是否为空：
+                # 白名单的空名单语义是「哪个群都不发」，不是「不限」。
                 continue
             if not group_id:
                 # 认不出群号：白名单模式下上面已经拦掉了，这里只可能是黑名单模式。
@@ -1465,13 +1750,14 @@ class StonePlugin(MaiBotPlugin):
                 nodes, overflow = await self._forward_nodes(collected, payloads)
             sent = False
             if nodes:
-                sent = bool(
-                    await self.ctx.send.forward(
-                        nodes,
-                        stream_id,
-                        timeout_ms=_FORWARD_TIMEOUT_MS,
-                        storage_message=False,
-                    )
+                # 转发是最贵的一次发送（几十 MB 的帧），抖一下整轮内容就全没了，
+                # 所以它比单条消息更值得重试。超时给得也最宽。
+                sent = await self._gate_of().run(
+                    self.ctx.send.forward,
+                    nodes,
+                    stream_id,
+                    timeout_ms=_FORWARD_TIMEOUT_MS,
+                    storage_message=False,
                 )
             # 聊天记录装不下的帖子要补发，否则它们会被当成「已经发过了」，
             # 下一轮直接跳过 —— 用户永远等不到这几条。
@@ -1537,24 +1823,26 @@ class StonePlugin(MaiBotPlugin):
             for video in sendable:
                 if await self._video_too_big(video, thread, limit):
                     continue
-                try:
-                    ok = await self.ctx.send.custom(
-                        "videourl",
-                        {"file": video.url},
-                        stream_id,
-                        timeout_ms=_VIDEO_SEND_TIMEOUT_MS,
-                        storage_message=False,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    self.ctx.logger.warning("[搬石] 发视频失败 %s：%s", video.url, exc)
-                    ok = False
+                # 视频已经是降级到「发链接」的最后一步了，这里重试是纯赚：
+                # 链接再发不出去，用户就完全不知道有这条视频。
+                ok = await self._gate_of().run(
+                    self.ctx.send.custom,
+                    "videourl",
+                    {"file": video.url},
+                    stream_id,
+                    timeout_ms=_VIDEO_SEND_TIMEOUT_MS,
+                    storage_message=False,
+                )
                 if not ok:
                     self.ctx.logger.warning("[搬石] 视频没发出去，改成发链接：%s", video.url)
                     missing.append(video.url)
             # 没发成的那些补一条链接，免得用户不知道有视频
             if missing:
-                await self.ctx.send.text(
-                    "视频：" + "\n".join(missing), stream_id, storage_message=False
+                await self._gate_of().run(
+                    self.ctx.send.text,
+                    "视频：" + chr(10).join(missing),
+                    stream_id,
+                    storage_message=False,
                 )
 
     def _video_limit_bytes(self) -> int:
@@ -1792,7 +2080,9 @@ class StonePlugin(MaiBotPlugin):
         images, paths, fallback = await self._card_images(thread, detail, payload)
         if not images:
             if fallback:
-                await self.ctx.send.text(fallback, stream_id, storage_message=False)
+                await self._gate_of().run(
+                    self.ctx.send.text, fallback, stream_id, storage_message=False
+                )
             return
         for index, image_b64 in enumerate(images):
             # 单独发长图时也优先用落盘路径：走 base64 的话一张图就要过一次
@@ -1803,30 +2093,36 @@ class StonePlugin(MaiBotPlugin):
     async def _send_page_image(self, stream_id: str, page_uri: str, image_b64: str) -> None:
         """发一张长图：有落盘路径就走路径，否则退回内嵌 base64。"""
         if page_uri:
-            try:
-                sent = await self.ctx.send.custom(
-                    "imageurl",
-                    {"file": page_uri},
-                    stream_id,
-                    storage_message=False,
-                    timeout_ms=_VIDEO_SEND_TIMEOUT_MS,
-                )
-                if sent is not False:
-                    return
-                self.ctx.logger.warning("[搬石] 长图按本地路径发送没成功，改用内嵌图片")
-            except Exception as exc:  # noqa: BLE001
-                self.ctx.logger.warning("[搬石] 长图按本地路径发送失败，改用内嵌图片：%s", exc)
-        await self.ctx.send.image(image_b64, stream_id, storage_message=False)
+            # 路径发不出去时**不要**重试到底再降级：这里已经有降级路径（内嵌 base64），
+            # 重试三次才换路等于白等好几秒。给一次机会，失败立刻降级。
+            sent = await self._gate_of().run(
+                self.ctx.send.custom,
+                "imageurl",
+                {"file": page_uri},
+                stream_id,
+                storage_message=False,
+                timeout_ms=_VIDEO_SEND_TIMEOUT_MS,
+            )
+            if sent:
+                return
+            self.ctx.logger.warning("[搬石] 长图按本地路径发送没成功，改用内嵌图片")
+        await self._gate_of().run(
+            self.ctx.send.image, image_b64, stream_id, storage_message=False
+        )
 
     async def _send_plain(
         self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
     ) -> None:
         blobs: dict[str, str] = payload.get("blobs") or {}
-        await self.ctx.send.text(self._thread_header(thread), stream_id, storage_message=False)
+        gate = self._gate_of()
+        await gate.run(
+            self.ctx.send.text, self._thread_header(thread), stream_id, storage_message=False
+        )
         for floor in detail.floors:
             text = str(getattr(floor, "text", "") or "").strip()
             if text:
-                await self.ctx.send.text(
+                await gate.run(
+                    self.ctx.send.text,
                     "%d楼 %s：%s" % (int(floor.fn), floor.author or "匿名", text),
                     stream_id,
                     storage_message=False,
@@ -1835,7 +2131,7 @@ class StonePlugin(MaiBotPlugin):
                 blob = blobs.get(url)
                 if not blob:
                     continue
-                await self.ctx.send.image(blob, stream_id, storage_message=False)
+                await gate.run(self.ctx.send.image, blob, stream_id, storage_message=False)
 
     async def _forward_nodes(
         self, collected: Sequence[tuple[Any, Any]], payloads: dict[str, dict[str, Any]]
@@ -2218,19 +2514,19 @@ class StonePlugin(MaiBotPlugin):
                 self.ctx.logger.info("[搬石] 同一条消息重复进入命令链，跳过：%s", message_id)
                 return True, "重复消息，已跳过", 1
             self._seen_message_ids.append(message_id)
-        is_admin = await self._may_maintain(
-            str(kwargs.get("platform") or ""),
-            str(kwargs.get("user_id") or ""),
-            stream_id,
-            kwargs.get("is_local_operator") is True,
+        platform = str(kwargs.get("platform") or "")
+        user_id = str(kwargs.get("user_id") or "")
+        local_operator = kwargs.get("is_local_operator") is True
+        can_move = await self._may_move(platform, user_id, stream_id, local_operator)
+        is_admin = can_move or await self._may_maintain(
+            platform, user_id, stream_id, local_operator
         )
         low = sub.lower()
         if not sub:
-            # 管理员敲 /搬石 就是想现在搬；其他人看到用法说明
-            if is_admin:
+            if can_move:
                 return await self._cmd_move(stream_id)
-            await self.ctx.send.text(_HELP_TEXT, stream_id, storage_message=False)
-            return True, "用法说明", 1
+            await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
+            return True, "没有权限", 1
         if low in ("帮助", "help", "?"):
             await self.ctx.send.text(_HELP_TEXT, stream_id, storage_message=False)
             return True, "用法说明", 1
@@ -2270,8 +2566,8 @@ class StonePlugin(MaiBotPlugin):
                 return True, "维护命令需要管理员权限", 1
             return await self._cmd_move(stream_id)
         if low in ("视频", "搬视频", "video"):
-            if not is_admin:
-                await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
+            if not can_move:
+                await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
             return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO, what="搬视频")
         if low in ("图文", "搬图文", "图"):
@@ -2306,14 +2602,14 @@ class StonePlugin(MaiBotPlugin):
         stream_id = str(kwargs.get("stream_id") or "")
         if not stream_id:
             return False, "缺少聊天流 ID", 1
-        is_admin = await self._may_maintain(
+        can_move = await self._may_move(
             str(kwargs.get("platform") or ""),
             str(kwargs.get("user_id") or ""),
             stream_id,
             kwargs.get("is_local_operator") is True,
         )
-        if not is_admin:
-            await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
+        if not can_move:
+            await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
             return True, "维护命令需要管理员权限", 1
         return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO, what="搬视频")
 
@@ -2437,48 +2733,64 @@ class StonePlugin(MaiBotPlugin):
             left = self._client.blocked_remaining()
             if left > 0:
                 lines.append("反爬冷却中，还剩 %d 秒。" % int(left))
-        lines.append("维护命令权限：" + self._admin_label())
+        lines.append("权限：" + self._admin_label())
         return "\n".join(lines)
 
     def _admin_label(self) -> str:
-        """状态里回显谁能用维护命令 —— 免得「说管理员能用却没地方配」。"""
+        """状态里回显谁能用命令 —— 免得「说管理员能用却没地方配」。"""
         section = getattr(self.config, "admin", None)
         names = sorted(_admin_ids(getattr(section, "admins", None)))
         groups = sorted(_group_set(getattr(section, "allow_groups", None)))
         parts: list[str] = []
         parts.append("管理员 " + "、".join(names) if names else "管理员（还没填）")
         if groups:
-            parts.append("放行群 " + "、".join(groups))
+            parts.append("可搬石的群 " + "、".join(groups))
         parts.append("主程序终端")
         return "；".join(parts)
-
-    async def _may_maintain(
+    async def _may_move(
         self, platform: str, user_id: str, stream_id: str, local_operator: bool
     ) -> bool:
-        """维护类命令能不能执行。
+        """能不能用「搬石 / 搬视频」这类立刻搬运的命令。
 
-        放行途径：主程序终端；插件设置「权限」一节里那张 QQ 号名单；该节里的
-        「管理员群」写明的群（群里谁都能用）。群按会话里的群号比对，比聊天流
-        ID 好认得多。
-
-        两张表都留空时才回落到宿主 ``[plugin] permission`` —— 那是宿主给整个
-        插件系统用的名单，改它会影响别的插件。一旦用户在这里填了人，就以这里
-        为准，不再看宿主那份；否则会出现「名单里明明没他，他还是能用」这种
-        对不上的行为。
+        管理员、「可搬石的群」里的任何人、主程序终端，以及两张名单都留空时
+        回落到宿主 ``[plugin] permission`` 名单。
         """
         if local_operator:
             return True
         section = getattr(self.config, "admin", None)
-        admins = _admin_ids(getattr(section, "admins", None))
-        groups = _group_set(getattr(section, "allow_groups", None))
         uid = _clean_id(user_id)
-        if uid and uid in admins:
+        if uid and uid in _admin_ids(getattr(section, "admins", None)):
             return True
         group = _clean_id(stream_id)
-        if group and group in groups:
+        if group and group in _group_set(getattr(section, "allow_groups", None)):
             return True
-        # 上面两张表任意一张填了人，就按名单说了算：没命中就是没权限。
-        if admins or groups:
+        return await self._host_permission_allows(platform, user_id)
+
+    async def _may_maintain(
+        self, platform: str, user_id: str, stream_id: str, local_operator: bool
+    ) -> bool:
+        """维护类命令（状态 / 重置）能不能执行。
+
+        只认管理员名单与主程序终端；「可搬石的群」只给搬运权限，不给维护权限。
+        """
+        if local_operator:
+            return True
+        section = getattr(self.config, "admin", None)
+        uid = _clean_id(user_id)
+        if uid and uid in _admin_ids(getattr(section, "admins", None)):
+            return True
+        # 管理员名单填了人就按名单说了算；没填时才看宿主名单。
+        if _admin_ids(getattr(section, "admins", None)):
+            return False
+        return await self._host_permission_allows(platform, user_id)
+
+    async def _host_permission_allows(self, platform: str, user_id: str) -> bool:
+        """回落到宿主 ``[plugin] permission``。两张名单填了任意一张就不看它。
+        """
+        section = getattr(self.config, "admin", None)
+        if _admin_ids(getattr(section, "admins", None)) or _group_set(
+            getattr(section, "allow_groups", None)
+        ):
             return False
         scoped = _scoped_user_id(platform, user_id)
         if not scoped:
@@ -2491,7 +2803,6 @@ class StonePlugin(MaiBotPlugin):
         if not isinstance(configured, (list, tuple, set, frozenset)):
             return False
         return scoped in _permission_set(configured)
-
 
 def create_plugin() -> StonePlugin:
     return StonePlugin()

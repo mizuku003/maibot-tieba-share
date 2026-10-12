@@ -46,7 +46,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.0.5",
+        default="1.0.6",
         description="配置版本号，请勿手动修改",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
@@ -79,7 +79,7 @@ class StoneSection(PluginConfigBase):
         description="内置吧，可勾选多个",
         json_schema_extra={
             "label": "内置吧（可多选）",
-            "hint": "内置的常用吧，可勾选多个",
+            "hint": "勾选即搬运；没列出的吧写到下一项",
             "x-widget": "select",
         },
     )
@@ -118,7 +118,7 @@ class StoneSection(PluginConfigBase):
     skip_top: bool = Field(
         default=True,
         description="跳过置顶帖",
-        json_schema_extra={"label": "跳过置顶帖", "hint": "不搬吧内置顶帖"},
+        json_schema_extra={"label": "跳过置顶帖", "hint": "吧内置顶帖一般是公告，通常保持开启"},
     )
     block_keywords: list[str] = Field(
         default_factory=lambda: ["水贴", "水楼", "+3"],
@@ -166,7 +166,7 @@ class ScheduleSection(PluginConfigBase):
         description="是否按下面的时间自动搬石",
         json_schema_extra={
             "label": "自动搬石",
-            "hint": "开启后按下列时间自动搬运",
+            "hint": "与手动 /搬石 相互独立",
         },
     )
     interval_minutes: int = Field(
@@ -251,16 +251,6 @@ class SendSection(PluginConfigBase):
     __ui_icon__ = "send"
     __ui_order__ = 3
 
-    send_media: bool = Field(
-        default=True,
-        description="用文本加图片的形式发",
-        json_schema_extra={"label": "发文本 + 图片", "hint": "逐层发文字和插图"},
-    )
-    send_card: bool = Field(
-        default=False,
-        description="把整帖渲染成一张长图发",
-        json_schema_extra={"label": "发一张长图", "hint": "整帖截成一张长图"},
-    )
     card_style: Literal["自绘卡片", "贴吧原页面"] = Field(
         default="贴吧原页面",
         description="长图用哪种样式",
@@ -271,9 +261,9 @@ class SendSection(PluginConfigBase):
         },
     )
     forward: bool = Field(
-        default=False,
+        default=True,
         description="用合并转发打包成聊天记录",
-        json_schema_extra={"label": "打包成聊天记录", "hint": "把本轮内容合并成一条聊天记录"},
+        json_schema_extra={"label": "打包成聊天记录", "hint": "关掉则逐帖单独发一张长图"},
     )
     forward_name: str = Field(
         default="？！石！？",
@@ -288,7 +278,7 @@ class SendSection(PluginConfigBase):
         description="帖子里的视频直接发出来",
         json_schema_extra={
             "label": "发视频",
-            "hint": "视频帖连同视频一起发",
+            "hint": "超过上限的整条跳过；取不到直链时退发链接",
         },
     )
     video_max_mb: int = Field(
@@ -306,7 +296,7 @@ class SendSection(PluginConfigBase):
         description="每条帖子带上原帖链接",
         json_schema_extra={
             "label": "带原帖链接",
-            "hint": "是否在内容里附带原帖地址",
+            "hint": "关掉后聊天记录的标题下面不再带原帖地址",
         },
     )
     thread_filter: Literal["不限", "只发图文帖", "只发视频帖"] = Field(
@@ -322,8 +312,8 @@ class SendSection(PluginConfigBase):
         default=9,
         ge=0,
         le=30,
-        description="每条帖子最多发几张图",
-        json_schema_extra={"label": "每条最多几张图", "hint": "只影响「发文本 + 图片」；0 = 只发文字"},
+        description="长图里最多放几张正文图",
+        json_schema_extra={"label": "长图里最多几张图", "hint": "长图会先插入若干张正文图；0 = 长图里不放图"},
     )
     image_max_width: int = Field(
         default=1080,
@@ -470,27 +460,17 @@ class ToolSection(PluginConfigBase):
             "hint": "麦麦一次能搬的上限；实际条数由麦麦自行决定，不会超过此值",
         },
     )
-    send_media: bool = Field(
-        default=False,
-        description="工具搬石时发文本加图片",
-        json_schema_extra={"label": "发文本 + 图片", "hint": "逐层发文字和插图"},
-    )
-    send_card: bool = Field(
-        default=True,
-        description="工具搬石时发一张长图",
-        json_schema_extra={"label": "发一张长图", "hint": "整帖截成一张长图"},
-    )
     post_link: bool = Field(
         default=False,
         description="工具搬石时带原帖链接",
-        json_schema_extra={"label": "带原帖链接", "hint": "是否在内容里附带原帖地址"},
+        json_schema_extra={"label": "带原帖链接", "hint": "关掉后聊天记录的标题下面不再带原帖地址"},
     )
     max_images: int = Field(
         default=9,
         ge=0,
         le=30,
-        description="工具搬石时每条最多几张图",
-        json_schema_extra={"label": "每条最多几张图", "hint": "只影响「发文本 + 图片」；0 = 只发文字"},
+        description="工具搬石时长图里最多几张图",
+        json_schema_extra={"label": "长图里最多几张图", "hint": "长图会先插入若干张正文图；0 = 长图里不放图"},
     )
     thread_filter: Literal["不限", "只发图文帖", "只发视频帖"] = Field(
         default="不限",
@@ -528,9 +508,11 @@ _DEFAULT_MIGRATIONS: dict[tuple[str, str], tuple[object, object]] = {
 
 
 # 群名单从「一份白名单 + 一份黑名单」改成了「模式 + 一份名单」。老配置要能平滑
-# 搬过来，否则用户升级完发现「明明配了群，却一个都不发」。两条旧名单的语义决定
-# 了怎么合：填过白名单的按白名单搬；只填了黑名单的按黑名单搬；两边都填过时以
-# 黑名单为准（原来的代码里黑名单优先级更高，保持这个语义）。
+# 搬过来，否则用户升级完发现「明明配了群，却一个都不发」。两条旧名单在旧代码里
+# 是**同时生效**的（先剔黑名单、再看白名单），所以合并时要按老语义等价折算：
+# 只填白名单 → 白名单模式；只填黑名单 → 黑名单模式；两边都填过 → 白名单模式、
+# 名单取「白名单 − 黑名单」。**两边都填过时不能只认黑名单** —— 那会把「只发这
+# 几个群」变成「除了这几个全发」，方向正好反了，而且一声不响。
 _GROUP_MOVES: dict[str, str] = {
     "include_groups": "白名单",
     "exclude_groups": "黑名单",
@@ -556,31 +538,53 @@ def migrate_config(raw: dict) -> bool:
     """
 
     changed = False
-    # 群名单：先在旧位置（send）和新位置（schedule）里把两条老名单都翻出来。
-    old_mode = ""
-    old_list: list[Any] = []
+    # 群名单：老配置是「一份白名单 + 一份黑名单」两份**同时生效**：
+    # 先剔掉黑名单里的群，再看白名单 —— 白名单空着就是谁都发，填了就只发
+    # 名单里的。现在合并成一个「模式 + 一份名单」的开关，搬家要按老语义
+    # 等价折算：
+    #   只填了白名单 → 白名单模式，名单照搬
+    #   只填了黑名单 → 黑名单模式，名单照搬
+    #   两边都填过   → 白名单模式，名单 = 白名单 − 黑名单（老语义是取交集）
+    #
+    # 两边都填过时**不能**只认黑名单：那等于把「只发这几个群」变成「除了这几个
+    # 全发」，方向正好反了，而且不报错，用户只会看到一堆群莫名其妙收到消息。
+    include_items: list[str] = []
+    exclude_items: list[str] = []
     for block_name in ("send", "schedule"):
         block = raw.get(block_name)
         if not isinstance(block, dict):
             continue
-        for field, mode in _GROUP_MOVES.items():
+        for field in _GROUP_MOVES:
             if field not in block:
                 continue
             value = block.pop(field)
             changed = True
-            items = [x for x in value if str(x or "").strip()] if isinstance(value, list) else []
-            if items:
-                # 黑名单最后处理，于是「两边都填过」时它胜出，跟旧代码的优先级一致。
-                old_mode = mode
-                old_list = items
-    if old_mode:
+            items = (
+                [str(x).strip() for x in value if str(x or "").strip()]
+                if isinstance(value, list)
+                else []
+            )
+            if field == "include_groups":
+                include_items.extend(items)
+            else:
+                exclude_items.extend(items)
+    if include_items or exclude_items:
         schedule_block = raw.get("schedule")
         if not isinstance(schedule_block, dict):
             raw["schedule"] = schedule_block = {}
+        if include_items:
+            banned = set(exclude_items)
+            keep: list[str] = []
+            for item in include_items:
+                if item not in banned and item not in keep:
+                    keep.append(item)
+            mode, listed = "白名单", keep
+        else:
+            mode, listed = "黑名单", list(dict.fromkeys(exclude_items))
         if not schedule_block.get("group_list"):
-            schedule_block["group_list"] = old_list
+            schedule_block["group_list"] = listed
         if not str(schedule_block.get("group_mode") or "").strip():
-            schedule_block["group_mode"] = old_mode
+            schedule_block["group_mode"] = mode
         changed = True
     # group_mode 的取值换过词：allow/deny → whitelist/blacklist → 中文。
     # 认得出旧词才改，用户填的中文原样留着。

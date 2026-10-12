@@ -75,7 +75,7 @@ _PLUGIN_VERSION = _read_manifest_version()
 from maibot_sdk import Command, MaiBotPlugin, Tool  # noqa: E402
 from maibot_sdk.types import ToolParameterInfo, ToolParamType  # noqa: E402
 
-from st_card import build_thread_html, build_thread_text, image_data_uri  # noqa: E402
+from st_card import build_thread_html, image_data_uri  # noqa: E402
 from st_config import StoneConfig, in_quiet_hours, migrate_config, resolve_forums  # noqa: E402
 from st_page import build_page_html, placeholder_urls  # noqa: E402
 from st_store import StoneStore  # noqa: E402
@@ -521,8 +521,8 @@ def _plan_card_chunks(
 class _ToolOptions:
     """工具那一轮用的发送选项：工具节有的取工具节，没有的回落到「发送」一节。
 
-    _send_options() 的调用点都只按属性名取值（send_media / send_card / post_link
-    …），这里把两个 section 拼成一层属性视图就够了，不必动那些调用点。
+    _send_options() 的调用点都只按属性名取值（post_link / max_images …），
+    这里把两个 section 拼成一层属性视图就够了，不必动那些调用点。
     """
 
     __slots__ = ("_tool", "_send")
@@ -549,12 +549,10 @@ class _SendGate:
     所以这里不接具体发送函数，只提供 wait 和 run：
 
     * wait —— 从桶里取一个令牌，取不到就睡到有为止；
-    * run —— 调一次真的发送，抛异常或返回 None 就退避重试。
+    * run —— 调一次真的发送，失败就退避重试（失败判定见 run 的 docstring）。
 
-    **为什么返回 None 也算失败**：宿主的 cap.call 拿不到返回值时
-    sent_message is not None 为假，能力层把它报成失败；而 False 是
-    「确实发了、但没拿到消息 id」，不算失败 —— 这两者不能混为一谈，
-    混了就会把已经发出去的消息再发一遍。所以判定写 ok is None。
+    SDK 把发送能力的返回值归一成 ``bool``：``True`` 是发出去了，
+    ``False`` / ``None`` 都是没发成，两种都要重试。
     """
 
     __slots__ = ("_tokens", "_at", "_rate", "_burst", "_retries", "_base")
@@ -634,6 +632,12 @@ class StonePlugin(MaiBotPlugin):
     """麦麦贴吧搬石插件。"""
 
     config_model = StoneConfig
+
+    # 兜底初值。宿主总是先走 on_load，但这几行要留着：测试桩会直接 new 一个
+    # 实例去调 on_config_update / on_unload，没有它们就是 AttributeError。
+    _client: Any = None
+    _proto: Any = None
+    _block: Any = None
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -832,12 +836,8 @@ class StonePlugin(MaiBotPlugin):
 
     def _mode_label(self) -> str:
         cfg = self.config.send
-        parts: list[str] = []
-        if cfg.send_media:
-            parts.append("文本+图片")
-        if cfg.send_card:
-            parts.append("长图（贴吧原页面）" if _card_style(cfg) == _CARD_STYLE_PAGE else "长图")
-        label = " / ".join(parts) or "（两种都没开，只会写日志）"
+        # 长图是唯一的内容形态，没有开关 —— 关掉它就没有任何东西可发了。
+        label = "长图（贴吧原页面）" if _card_style(cfg) == _CARD_STYLE_PAGE else "长图"
         if cfg.forward:
             label += "（打包成聊天记录）"
         return label
@@ -1154,6 +1154,10 @@ class StonePlugin(MaiBotPlugin):
         # collected 里每项带上「属于哪个吧」，发送成功后才好按吧记账
         collected: list[tuple[Any, Any]] = []
         forum_of: dict[str, str] = {}
+        # 长图没能渲出来、因而一条都没发出去的帖子。它们**不能**被记成
+        # 「已搬过」—— 记了就等于永久丢帖（渲染失败多半只是临时抽风，
+        # 下一轮多半就好了）。
+        skipped_tids: set[str] = set()
         blocked = ""
         proto = getattr(self, "_proto", None)
         for forum in forums:
@@ -1222,18 +1226,25 @@ class StonePlugin(MaiBotPlugin):
             await self._hold_until(post_at)
             for stream_id in targets:
                 try:
-                    await self._deliver(stream_id, collected, payloads)
+                    outcome = await self._deliver(stream_id, collected, payloads)
                 except Exception as exc:  # noqa: BLE001
                     self.ctx.logger.warning("[搬石] 往 %s 发送失败：%s", stream_id, exc)
                     failed += 1
                     continue
                 delivered += 1
+                for thread, _detail in outcome:
+                    skipped_tids.add(thread.tid)
             # 只有「每个目标都收到了」才记「搬过了」。
             # 去重是帖子级的，任何一个群漏收都意味着它再也等不到这条 ——
             # 哪怕是永久丢帖。所以只要有一个目标失败就整条不记账，
             # 让下一轮重搬一次（收到过的群会重复看到，比收不到强）。
+            #
+            # 另外，长图没渲出来的帖子也**不能**记账：它压根没发到群里，
+            # 记了就等于永久丢帖。这类帖留给下一轮重试。
             if targets and not failed:
                 for thread, _detail in collected:
+                    if thread.tid in skipped_tids:
+                        continue
                     store.mark(forum_of.get(thread.tid, ""), thread.tid, thread.title)
         store.flush()
 
@@ -1630,10 +1641,10 @@ class StonePlugin(MaiBotPlugin):
         if client is None:
             return payloads
         style = _card_style(cfg)
-        want_floors = bool(cfg.send_media) or (
-            bool(cfg.send_card) and style != _CARD_STYLE_PAGE
-        )
-        want_page = bool(cfg.send_card) and style == _CARD_STYLE_PAGE
+        # 正文图只服务长图：自绘卡片要把它们插进卡片里，原页面长图要把它们
+        # 补进截图（手机版页面根本没带全图）。长图恒开，所以两项恒真。
+        want_floors = True
+        want_page = style == _CARD_STYLE_PAGE
         limit = int(cfg.max_images)
         max_width = int(cfg.image_max_width)
         quality = int(cfg.image_quality)
@@ -1749,44 +1760,22 @@ class StonePlugin(MaiBotPlugin):
             return "%s\n%s · %d 回复" % (head, getattr(thread, "url", ""), replies)
         return "%s\n%d 回复" % (head, replies)
 
-    def _forward_digest(self, thread: Any, detail: Any, fallback: str) -> str:
-        """长图进不了聊天记录时，退回节点里用的纯正文提要。
-
-        首行必须去掉。``build_thread_text`` 的第一行固定是「【吧】标题」，而每
-        个帖子在聊天记录里已经有一个标题节点了；提要再带一次，这一帖就会在
-        聊天记录里出现两遍，其中一遍只有标题 —— 用户报的「有的帖子重复发送，
-        有的没内容」正是这里（``probe_stone213_forward_dup.py`` 复现）。
-        """
-        digest = str(fallback or "").strip()
-        if not digest:
-            digest = build_thread_text(
-                thread,
-                detail.floors,
-                max_images=int(self._send_options().max_images),
-            ).strip()
-        lines = digest.split("\n")
-        # 只吃掉落单的首行；确实没有正文时返回空串，调用方就不补节点了。
-        return "\n".join(lines[1:]).strip()
-
     async def _deliver(
         self,
         stream_id: str,
         collected: Sequence[tuple[Any, Any]],
         payloads: dict[str, dict[str, Any]],
-    ) -> None:
+    ) -> list[tuple[Any, Any]]:
+        """把本轮内容发到某个群。返回**没发出去**的帖子（长图没渲出来的那些）。
+
+        调用方必须拿这个返回值去排除记账：这些帖一条都没到群里，记成
+        「已搬过」就是永久丢帖。
+        """
         cfg = self._send_options()
-        # 发视频是独立开关：只开了它、关掉卡片和图文时，也该把视频发出去，
-        # 所以这里不能拿 send_card/send_media 当总闸。
-        want_video = bool(getattr(cfg, "send_video", True))
-        if not (cfg.send_card or cfg.send_media or want_video):
-            return
         if cfg.forward:
-            nodes: list[dict[str, Any]] = []
-            # 卡片和图文都关着时不要去合成转发：那会造出一条只有视频的空壳聊天记录，
-            # 视频本来就该单独发。
+            # 长图恒开，所以每次都要合成聊天记录；装不下的帖子交回 overflow。
             overflow: list[tuple[Any, Any]] = []
-            if cfg.send_card or cfg.send_media:
-                nodes, overflow = await self._forward_nodes(collected, payloads)
+            nodes, overflow = await self._forward_nodes(collected, payloads)
             sent = False
             if nodes:
                 # 转发是最贵的一次发送（几十 MB 的帧），抖一下整轮内容就全没了，
@@ -1806,26 +1795,30 @@ class StonePlugin(MaiBotPlugin):
             # 一并按「单独发」补上 —— 只补视频是不够的，正文和长图同样会丢，
             # 而它们已经被记成「已搬过」，下一轮不会重来。
             missed = list(overflow) if sent else list(collected)
+            skipped: list[tuple[Any, Any]] = []
             if missed:
                 self.ctx.logger.info(
                     "[搬石] 有 %d 条帖子没能进聊天记录，改单独发", len(missed)
                 )
                 for thread, detail in missed:
-                    await self._send_cards(
+                    ok = await self._send_cards(
                         stream_id, thread, detail, payloads.get(thread.tid) or {}
                     )
-                    await self._send_plain(
-                        stream_id, thread, detail, payloads.get(thread.tid) or {}
-                    )
+                    if not ok:
+                        # 长图没能渲出来。不补文字、不补图文 —— 那种"提要"在群里
+                        # 就是刷屏。这帖当没搬过，交回去让 _run_locked 不记账。
+                        skipped.append((thread, detail))
                 await self._send_videos(stream_id, missed, payloads)
-            return
-        if cfg.send_card:
-            for thread, detail in collected:
-                await self._send_cards(stream_id, thread, detail, payloads.get(thread.tid) or {})
-        if cfg.send_media:
-            for thread, detail in collected:
-                await self._send_plain(stream_id, thread, detail, payloads.get(thread.tid) or {})
+            return skipped
+        skipped = []
+        for thread, detail in collected:
+            ok = await self._send_cards(
+                stream_id, thread, detail, payloads.get(thread.tid) or {}
+            )
+            if not ok:
+                skipped.append((thread, detail))
         await self._send_videos(stream_id, collected, payloads)
+        return skipped
 
     async def _send_videos(
         self,
@@ -1951,10 +1944,10 @@ class StonePlugin(MaiBotPlugin):
                 image_b64 = await self._render_page(html)
                 if image_b64:
                     return [image_b64], [self._save_page_image(image_b64)], ""
-                self.ctx.logger.warning("[搬石] 原页面长图渲染失败，这条退回文本")
-                return [], [], build_thread_text(
-                    thread, detail.floors, max_images=int(cfg.max_images)
-                )
+                # 渲染失败**不补文字**：那种"提要"在群里就是刷屏，而且它既不完整
+                # 也不好看。这帖当没搬过，交回去下轮重试（渲染器多半只是临时抽风）。
+                self.ctx.logger.warning("[搬石] 原页面长图渲染失败，这帖跳过")
+                return [], [], ""
             self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
         uris: dict[str, str] = payload.get("uris") or {}
         sizes: dict[str, tuple[int, int]] = payload.get("sizes") or {}
@@ -2003,11 +1996,9 @@ class StonePlugin(MaiBotPlugin):
                     scale,
                 )
             if not image_b64:
-                # 渲染不出来不能什么都不发：退回纯文本
-                self.ctx.logger.warning("[搬石] 长图渲染失败或太大，这条退回文本")
-                return [], [], build_thread_text(
-                    thread, detail.floors, max_images=int(cfg.max_images)
-                )
+                # 见上：渲不出来就跳过这帖，不补任何文字。
+                self.ctx.logger.warning("[搬石] 长图渲染失败或太大，这帖跳过")
+                return [], [], ""
             images.append(image_b64)
             paths.append(self._save_page_image(image_b64))
         return images, paths, ""
@@ -2115,19 +2106,22 @@ class StonePlugin(MaiBotPlugin):
 
     async def _send_cards(
         self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
-    ) -> None:
-        images, paths, fallback = await self._card_images(thread, detail, payload)
+    ) -> bool:
+        """发这一帖的长图。返回 False = 长图没渲出来，这帖没发出去。
+
+        渲不出来时**什么都不发**：既不补纯文字提要，也不退回「逐层发图文」——
+        两种兜底在群里都是刷屏，内容还不完整。调用方拿到 False 就别把这帖
+        记成「已搬过」，下一轮它会重来（渲染失败多半只是临时抽风）。
+        """
+        images, paths, _fallback = await self._card_images(thread, detail, payload)
         if not images:
-            if fallback:
-                await self._gate_of().run(
-                    self.ctx.send.text, fallback, stream_id, storage_message=False
-                )
-            return
+            return False
         for index, image_b64 in enumerate(images):
             # 单独发长图时也优先用落盘路径：走 base64 的话一张图就要过一次
             # 16MB 的 RPC 帧，路径只有两百来字节。路径为空才退回内嵌。
             page = paths[index] if index < len(paths) else ""
             await self._send_page_image(stream_id, page, image_b64)
+        return True
 
     async def _send_page_image(self, stream_id: str, page_uri: str, image_b64: str) -> None:
         """发一张长图：有落盘路径就走路径，否则退回内嵌 base64。"""
@@ -2148,29 +2142,6 @@ class StonePlugin(MaiBotPlugin):
         await self._gate_of().run(
             self.ctx.send.image, image_b64, stream_id, storage_message=False
         )
-
-    async def _send_plain(
-        self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
-    ) -> None:
-        blobs: dict[str, str] = payload.get("blobs") or {}
-        gate = self._gate_of()
-        await gate.run(
-            self.ctx.send.text, self._thread_header(thread), stream_id, storage_message=False
-        )
-        for floor in detail.floors:
-            text = str(getattr(floor, "text", "") or "").strip()
-            if text:
-                await gate.run(
-                    self.ctx.send.text,
-                    "%d楼 %s：%s" % (int(floor.fn), floor.author or "匿名", text),
-                    stream_id,
-                    storage_message=False,
-                )
-            for url in list(floor.images or []):
-                blob = blobs.get(url)
-                if not blob:
-                    continue
-                await gate.run(self.ctx.send.image, blob, stream_id, storage_message=False)
 
     async def _forward_nodes(
         self, collected: Sequence[tuple[Any, Any]], payloads: dict[str, dict[str, Any]]
@@ -2218,115 +2189,66 @@ class StonePlugin(MaiBotPlugin):
             )
             header_cost = len(str(header.get("data") or "")) + _FORWARD_NODE_OVERHEAD
             used_bytes += header_cost
-            if cfg.send_card:
-                images, paths, fallback = await self._card_images(thread, detail, payload)
-                if images:
-                    # 长图优先用「本地路径引用」：节点里只放一个 file:// 路径，
-                    # 帧里是两百来字节，**与图片有多大无关**。这样一张 6MB 的长图
-                    # 不再吃掉整条预算，后面的帖子也不必被踢出去单独发。
-                    # 落盘失败（paths 对应项为空串）才退回内嵌 base64。
-                    segments: list[dict[str, Any]] = []
-                    embedded_cost = 0
-                    for index, b64 in enumerate(images):
-                        page = paths[index] if index < len(paths) else ""
-                        if page:
-                            segments.append(
-                                {
-                                    "type": "dict",
-                                    "data": {
-                                        "type": "imageurl",
-                                        "data": {"file": page},
-                                    },
-                                }
-                            )
-                            # 路径段的帧开销虽然只有两百来字节，但也得记账，
-                            # 否则预算算的是「内嵌部分」而不是「整条节点」。
-                            embedded_cost += _PATH_SEGMENT_COST
-                        else:
-                            segments.append({"type": "image", "content": b64})
-                            embedded_cost += len(b64)
-                    if used_bytes + embedded_cost > budget:
-                        # 只在内嵌兜底时才会撞预算。这帖整帖退出去单独发：
-                        # 长图和正文都还在，只是不再留在聊天记录里。
-                        self.ctx.logger.info(
-                            "[搬石] 第 %s 帖的长图装不下这条聊天记录了（%d 字节），这帖改单独发",
-                            thread.tid,
-                            embedded_cost,
-                        )
-                        del nodes[first:]
-                        used_bytes -= header_cost
-                        deferred.append((thread, detail))
-                        continue
-                    used_bytes += embedded_cost
-                    nodes.append(
-                        {
-                            "nickname": self._forward_name(),
-                            "user_id": "",
-                            "segments": segments,
-                        }
-                    )
-                elif fallback:
-                    # 只有长图渲染不出来时才走这里。提要首行是标题，而标题节点
-                    # 上面已经发过，去掉它，节点里只留正文。
-                    digest = self._forward_digest(thread, detail, fallback)
-                    if digest:
-                        nodes.append(
-                            {
-                                "nickname": self._forward_name(),
-                                "user_id": "",
-                                "segments": [{"type": "text", "data": digest}],
-                            }
-                        )
-                        used_bytes += len(digest) + _FORWARD_NODE_OVERHEAD
-            if not cfg.send_media:
-                self._attach_videos(nodes, first, detail, payload)
+            images, paths, _fallback = await self._card_images(thread, detail, payload)
+            if not images:
+                # 长图渲不出来。不能把标题节点孤零零留在聊天记录里 ——
+                # 那就是一条只有标题、没有正文的刷屏节点。整帖退出这条
+                # 记录，交给 _deliver 单独发（那边同样渲不出来就会跳过
+                # 这帖、不记账）。
+                self.ctx.logger.warning(
+                    "[搬石] 第 %s 帖的长图没能渲染出来，退出这条聊天记录", thread.tid
+                )
+                del nodes[first:]
+                used_bytes -= header_cost
+                deferred.append((thread, detail))
                 continue
-            used = 0
-            for floor in detail.floors:
-                if used >= _FORWARD_FLOOR_NODES:
-                    break
+            if images:
+                # 长图优先用「本地路径引用」：节点里只放一个 file:// 路径，
+                # 帧里是两百来字节，**与图片有多大无关**。这样一张 6MB 的长图
+                # 不再吃掉整条预算，后面的帖子也不必被踢出去单独发。
+                # 落盘失败（paths 对应项为空串）才退回内嵌 base64。
                 segments: list[dict[str, Any]] = []
-                text = str(getattr(floor, "text", "") or "").strip()
-                if text:
-                    segments.append(
-                        {
-                            "type": "text",
-                            "data": "%d楼：%s" % (int(floor.fn), text),
-                        }
-                    )
-                for url in list(floor.images or []):
-                    blob = blobs.get(url)
-                    if not blob:
-                        continue
-                    # 正文小图同样优先落盘走路径：省下的不只是这几百 KB，
-                    # 更是「一张大图吃掉整条预算」的连锁反应。落盘失败才内嵌。
-                    page = self._save_blob_image(blob)
+                embedded_cost = 0
+                for index, b64 in enumerate(images):
+                    page = paths[index] if index < len(paths) else ""
                     if page:
                         segments.append(
                             {
                                 "type": "dict",
-                                "data": {"type": "imageurl", "data": {"file": page}},
+                                "data": {
+                                    "type": "imageurl",
+                                    "data": {"file": page},
+                                },
                             }
                         )
-                        continue
-                    # 图片段的 base64 必须放在 content 里：宿主按 content 写
-                    # binary_data_base64。装不下就丢掉这一张，后面更小的兴许还塞得进。
-                    if used_bytes + len(blob) > budget:
-                        continue
-                    used_bytes += len(blob)
-                    segments.append({"type": "image", "content": blob})
-                if not segments:
+                        # 路径段的帧开销虽然只有两百来字节，但也得记账，
+                        # 否则预算算的是「内嵌部分」而不是「整条节点」。
+                        embedded_cost += _PATH_SEGMENT_COST
+                    else:
+                        segments.append({"type": "image", "content": b64})
+                        embedded_cost += len(b64)
+                if used_bytes + embedded_cost > budget:
+                    # 只在内嵌兜底时才会撞预算。这帖整帖退出去单独发：
+                    # 长图和正文都还在，只是不再留在聊天记录里。
+                    self.ctx.logger.info(
+                        "[搬石] 第 %s 帖的长图装不下这条聊天记录了（%d 字节），这帖改单独发",
+                        thread.tid,
+                        embedded_cost,
+                    )
+                    del nodes[first:]
+                    used_bytes -= header_cost
+                    deferred.append((thread, detail))
                     continue
+                used_bytes += embedded_cost
                 nodes.append(
                     {
-                        "nickname": str(getattr(floor, "author", "") or "").strip()
-                        or self._forward_name(),
+                        "nickname": self._forward_name(),
                         "user_id": "",
                         "segments": segments,
                     }
                 )
-                used_bytes += _FORWARD_NODE_OVERHEAD
-                used += 1
+            # 长图之外不再往节点里塞逐层的文字和插图：那种节点在聊天记录里
+            # 就是刷屏，而且长图已经把正文和插图都带上了。这里只挂视频。
             self._attach_videos(nodes, first, detail, payload)
             # 连纯文字都塞满了，再往后只会更糟：停在这里。
             # **但剩下的帖子不能就这么算了**：这条聊天记录待会儿照样发得出去，

@@ -46,7 +46,6 @@
     ]
   },
   "plugin_type": "tool",
-  "changelog": "CHANGELOG.md",
   "display": {
     "icon": {
       "type": "local",

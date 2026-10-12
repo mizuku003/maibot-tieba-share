@@ -236,6 +236,11 @@ _CARD_RENDER_TIMEOUT_MS = 45_000
 # （napcat.mjs 的 checkUriType：`uri.startsWith("file:")` -> Local，且本地文件
 # 原样使用不复制），已在 chatbot 测试组真机验证。
 _PAGE_CACHE_FILENAME = "page_%s_%d.png"
+# 落盘前先认一眼文件头。渲染器偶尔会返回一段空壳或错误页文本，
+# 那种东西写进 pages/ 只会变成一堆协议端读不出来的垃圾（曾经因此在插件
+# 目录里堆过上万张全 0xFF 的假图）。认不出来就不落盘，调用方退回内嵌图片。
+_PNG_MAGIC = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+_JPEG_MAGIC = bytes([0xFF, 0xD8, 0xFF])
 # 落盘的长图保留份数：只留最近这些张，避免长年累月把磁盘塞满。
 # 转发是异步投递的，删太早会让 QQ 那边取不到图，所以按「张数」而不是「时间」清。
 _PAGE_CACHE_KEEP = 60
@@ -730,6 +735,15 @@ class StonePlugin(MaiBotPlugin):
         try:
             data = base64.b64decode(image_b64)
         except Exception:  # noqa: BLE001
+            return ""
+        if not (data.startswith(_PNG_MAGIC) or data.startswith(_JPEG_MAGIC)):
+            # 不是能认的图片就别往盘上写：省得 pages/ 里堆一批永远读不出来的东西
+            if log_failure:
+                self.ctx.logger.warning(
+                    "[搬石] 渲染结果不是有效图片（%s 字节，开头 %r），这条改用内嵌图片",
+                    len(data),
+                    data[:8],
+                )
             return ""
         try:
             directory = self._page_cache_dir()

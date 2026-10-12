@@ -1157,14 +1157,16 @@ class StonePlugin(MaiBotPlugin):
                     max_chars=int(cfg.fetch.max_chars),
                     max_comments=int(getattr(cfg.fetch, "max_comments", 3) or 0),
                 )
-                if blocked:
-                    break
                 if detail is None:
+                    # 这一帖彻底没拿到。被拦的话就到此为止，别再敲了。
+                    if blocked:
+                        break
                     continue
+                # **先收下手里这帖，再看要不要停**：protobuf 翻到第 2 页才被拦时
+                # detail 是有效的（网页版那份），先 break 会把刚抓到的东西扔掉。
                 if not detail.floors:
                     self.ctx.logger.debug("[搬石] 帖子 %s 没有解析到楼层，跳过", thread.tid)
-                    continue
-                if not self._passes_filter(detail):
+                elif not self._passes_filter(detail):
                     self.ctx.logger.debug(
                         "[搬石] 帖子 %s 不符合「%s」，跳过",
                         thread.tid,
@@ -1172,10 +1174,12 @@ class StonePlugin(MaiBotPlugin):
                     )
                     # 筛选掉的和发送无关，现在就能记账，不用等投递
                     store.mark(forum, thread.tid, thread.title)
-                    continue
-                collected.append((thread, detail))
-                forum_of[thread.tid] = forum
-                got += 1
+                else:
+                    collected.append((thread, detail))
+                    forum_of[thread.tid] = forum
+                    got += 1
+                if blocked:
+                    break
             store.mark_run(forum)
             if blocked:
                 break
@@ -1325,6 +1329,7 @@ class StonePlugin(MaiBotPlugin):
         except StoneTiebaError as exc:
             html_error = str(exc)
 
+        block_error = ""
         if proto is not None:
             try:
                 proto_detail = await proto.fetch_thread_detail(
@@ -1334,7 +1339,16 @@ class StonePlugin(MaiBotPlugin):
                     max_comments=max_comments,
                 )
             except StoneBlockedError as exc:
-                return None, str(exc)
+                # **不要**在这里直接放弃手上那份。protobuf 翻到第 2 页才被拦时，
+                # HTML 那边通常已经拿到了完整正文（还有长图要的 raw），
+                # 直接 return None 等于把整帖丢掉、白抓一次。
+                # 先把能发的发掉，再把「被拦了」这个事实交给调用方停掉整轮。
+                block_error = str(exc)
+                self.ctx.logger.warning(
+                    "[搬石] 帖子 %s 的 protobuf 正文被反爬拦下（%s），用网页版已有的内容继续",
+                    thread.tid,
+                    exc,
+                )
             except Exception as exc:  # noqa: BLE001
                 self.ctx.logger.warning(
                     "[搬石] 帖子 %s 的正文（protobuf）没取到：%s", thread.tid, exc
@@ -1344,8 +1358,8 @@ class StonePlugin(MaiBotPlugin):
 
         if detail is None:
             self.ctx.logger.warning("[搬石] 帖子 %s 取正文失败：%s", thread.tid, html_error)
-            return None, ""
-        return detail, ""
+            return None, block_error
+        return detail, block_error
 
     @staticmethod
     def _merge_detail(html_detail: Any, proto_detail: Any) -> Any:

@@ -337,7 +337,7 @@ class SendSection(PluginConfigBase):
         json_schema_extra={"label": "长图宽度", "hint": "只对「自绘卡片」有效"},
     )
     closing_text: str = Field(
-        default="主……主人，这……这是我今天发……发……发现的…有趣贴子♥别……别打我喵呜~",
+        default="主……主人，这……这是我今天发……发……发现的…有趣贴子♥",
         description="一轮搬运结束后补的一句话",
         json_schema_extra={
             "label": "结束语",

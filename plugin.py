@@ -338,8 +338,18 @@ def _admin_ids(values: Any) -> set[str]:
 
 # 群名单的两种模式。默认白名单，且默认名单为空 —— 也就是**默认哪个群都不发**，
 # 要用户自己把群号填进来才开始工作。
-_GROUP_ALLOW = "allow"
-_GROUP_DENY = "deny"
+_GROUP_ALLOW = "白名单"
+_GROUP_DENY = "黑名单"
+# 老配置里存过 allow/deny 和 whitelist/blacklist（取值换过两次）。
+# 迁移函数会把它们搬成中文，但万一有实例没走到迁移
+# （比如用户手改过 config.toml），这里也认旧词 —— 认错方向的后果是
+# 黑名单被当成白名单，从「只发这几个群」变成「除了这几个全发」。
+_GROUP_ALIASES = {
+    "allow": _GROUP_ALLOW,
+    "deny": _GROUP_DENY,
+    "whitelist": _GROUP_ALLOW,
+    "blacklist": _GROUP_DENY,
+}
 
 
 def _group_set(values: Any) -> set[str]:
@@ -1509,6 +1519,7 @@ class StonePlugin(MaiBotPlugin):
         # 群名单在「定时」一节：它管的是发给谁，不是发出来长什么样。
         cfg = self.config.schedule
         mode = str(getattr(cfg, "group_mode", _GROUP_ALLOW) or _GROUP_ALLOW).strip().lower()
+        mode = _GROUP_ALIASES.get(mode, mode)  # 老词一律归一到中文
         listed = {_clean_id(x) for x in getattr(cfg, "group_list", None) or []}
         listed.discard("")
         if mode == _GROUP_DENY:

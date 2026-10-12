@@ -53,7 +53,7 @@ class PluginSection(PluginConfigBase):
 
 
 class StoneSection(PluginConfigBase):
-    """搬哪些吧、每轮搬几条。"""
+    """搬运范围：逛哪些吧、每轮搬几条、按什么条件筛选。"""
 
     __ui_label__ = "搬石"
     __ui_icon__ = "hammer"
@@ -155,7 +155,7 @@ def resolve_forums(section: StoneSection) -> list[str]:
 
 
 class ScheduleSection(PluginConfigBase):
-    """自动搬石：每隔一段时间，或每天定点搬一轮。"""
+    """自动搬运的排期，以及投递到哪些群。"""
 
     __ui_label__ = "定时"
     __ui_icon__ = "clock"
@@ -166,7 +166,7 @@ class ScheduleSection(PluginConfigBase):
         description="是否按下面的时间自动搬石",
         json_schema_extra={
             "label": "自动搬石",
-            "hint": "开启后按下面的时间自动搬运",
+            "hint": "开启后按下列时间自动搬运",
         },
     )
     interval_minutes: int = Field(
@@ -194,15 +194,15 @@ class ScheduleSection(PluginConfigBase):
         description="提前多少秒开始准备",
         json_schema_extra={
             "label": "提前开始（秒）",
-            "hint": "提前多少秒开始取帖，到点准时发出",
+            "hint": "提前多少秒开始取帖，到时间点后再发送",
         },
     )
     # 用 Literal 而不是自己往 json_schema_extra 里塞 choices：
     # SDK 的 _extract_select_choices 只认 Literal 注解
     # （maibot_sdk/config.py:446），手写的 choices 面板根本不看。
-    group_mode: Literal["allow", "deny"] = Field(
-        default="allow",
-        description="群名单模式：allow = 只发名单里的群，deny = 名单里的群不发",
+    group_mode: Literal["白名单", "黑名单"] = Field(
+        default="白名单",
+        description="群名单模式：白名单 = 只发名单里的群，黑名单 = 名单里的群不发",
         json_schema_extra={
             "label": "群名单模式",
             "hint": "白名单：只在下面列的群里发；黑名单：下面列的群不发。默认白名单且名单为空 = 哪个群都不发",
@@ -214,7 +214,7 @@ class ScheduleSection(PluginConfigBase):
         description="群名单（填群号，一行一个）",
         json_schema_extra={
             "label": "群名单",
-            "hint": "白名单模式下只有这些群会收到；黑名单模式下这些群不收。填群号，一行一个",
+            "hint": "白名单：只有这些群会收到；黑名单：这些群不收。填群号，一行一个",
         },
     )
     daily_times: list[str] = Field(
@@ -245,7 +245,7 @@ class ScheduleSection(PluginConfigBase):
 
 
 class SendSection(PluginConfigBase):
-    """搬出来的帖子在群里长什么样。"""
+    """定时搬运与手动指令的发送形态。"""
 
     __ui_label__ = "发送"
     __ui_icon__ = "send"
@@ -298,7 +298,7 @@ class SendSection(PluginConfigBase):
         description="视频文件大小上限（MB）",
         json_schema_extra={
             "label": "视频大小上限",
-            "hint": "单位 MB；超过后跳过该视频；0 = 不限",
+            "hint": "单位 MB；超过后整条视频跳过，不发链接；0 = 不限",
         },
     )
     post_link: bool = Field(
@@ -337,7 +337,7 @@ class SendSection(PluginConfigBase):
         ge=40,
         le=100,
         description="图片压缩质量（JPEG）",
-        json_schema_extra={"label": "图片压缩质量", "hint": "建议 80~90；数值越高越清晰也越占空间"},
+        json_schema_extra={"label": "图片压缩质量", "hint": "建议 80~90；数值越大越清晰，体积也越大"},
     )
     card_width: int = Field(
         default=830,
@@ -349,7 +349,7 @@ class SendSection(PluginConfigBase):
 
 
 class FetchSection(PluginConfigBase):
-    """抓取细节，默认值一般不用动。"""
+    """抓取细节，通常保持默认即可。"""
 
     __ui_label__ = "抓取"
     __ui_icon__ = "sliders-horizontal"
@@ -360,7 +360,7 @@ class FetchSection(PluginConfigBase):
         ge=1,
         le=5,
         description="列表翻几页",
-        json_schema_extra={"label": "列表翻几页", "hint": "列表翻页数，每页 30 条"},
+        json_schema_extra={"label": "列表翻几页", "hint": "每页 30 条；翻得越多越容易被贴吧拦截"},
     )
     max_floors: int = Field(
         default=30,
@@ -391,14 +391,14 @@ class FetchSection(PluginConfigBase):
         ge=0.0,
         le=30.0,
         description="两次请求之间歇多少秒",
-        json_schema_extra={"label": "请求间隔（秒）", "hint": "两次请求之间的间隔秒数；请勿设为 0"},
+        json_schema_extra={"label": "请求间隔（秒）", "hint": "两次请求之间的间隔秒数；设为 0 会显著提高被拦截的概率"},
     )
     timeout: int = Field(
         default=30,
         ge=5,
         le=120,
         description="单次 HTTP 请求超时（秒）",
-        json_schema_extra={"label": "请求超时（秒）", "hint": "单次请求超时秒数；网络较慢时调大"},
+        json_schema_extra={"label": "请求超时（秒）", "hint": "单次请求超时秒数；网络较慢时可适当调大"},
     )
     proxy: str = Field(
         default="",
@@ -413,7 +413,7 @@ class FetchSection(PluginConfigBase):
 
 
 class AdminSection(PluginConfigBase):
-    """谁能用维护命令。"""
+    """谁可以使用本插件的指令。"""
 
     __ui_label__ = "权限"
     __ui_icon__ = "shield"
@@ -424,7 +424,7 @@ class AdminSection(PluginConfigBase):
         description="管理员的 QQ 号（一行一个）",
         json_schema_extra={
             "label": "管理员",
-            "hint": "能用全部命令的 QQ 号，一行一个",
+            "hint": "能用全部命令的 QQ 号，一行一个；本项与下一项都留空时，沿用宿主插件权限名单",
         },
     )
     allow_groups: list[str] = Field(
@@ -432,13 +432,13 @@ class AdminSection(PluginConfigBase):
         description="能用搬石指令的群（一行一个群号）",
         json_schema_extra={
             "label": "可搬石的群",
-            "hint": "这些群里任何人都能用 /搬石；一行一个群号",
+            "hint": "这些群里任何人都能用 /搬石、/搬视频；维护命令仍只限管理员。一行一个群号",
         },
     )
 
 
 class ToolSection(PluginConfigBase):
-    """麦麦自己搬石时用的参数，与「发送」互不影响。"""
+    """麦麦自主搬运时使用的参数，与上一节的发送形态相互独立。"""
 
     __ui_label__ = "工具"
     __ui_icon__ = "wrench"
@@ -467,7 +467,7 @@ class ToolSection(PluginConfigBase):
         description="麦麦一次最多搬几条",
         json_schema_extra={
             "label": "一次最多几条",
-            "hint": "麦麦一次最多搬几条",
+            "hint": "麦麦一次能搬的上限；实际条数由麦麦自行决定，不会超过此值",
         },
     )
     send_media: bool = Field(
@@ -532,8 +532,20 @@ _DEFAULT_MIGRATIONS: dict[tuple[str, str], tuple[object, object]] = {
 # 了怎么合：填过白名单的按白名单搬；只填了黑名单的按黑名单搬；两边都填过时以
 # 黑名单为准（原来的代码里黑名单优先级更高，保持这个语义）。
 _GROUP_MOVES: dict[str, str] = {
-    "include_groups": "allow",
-    "exclude_groups": "deny",
+    "include_groups": "白名单",
+    "exclude_groups": "黑名单",
+}
+
+# group_mode 的取值换过两次：allow/deny → whitelist/blacklist → 中文。
+# 中间那一步没发布过，但本机调试时写进过 config.toml，
+# 所以三种叫法都得认。不搬就会掉进 else 分支 —— 那等于把用户的
+# 黑名单悄悄变成白名单，从「只发这几个群」变成「除了这几个全发」，
+# 方向正好反了，必须搬。
+_GROUP_MODE_WORDS: dict[str, str] = {
+    "allow": "白名单",
+    "deny": "黑名单",
+    "whitelist": "白名单",
+    "blacklist": "黑名单",
 }
 
 
@@ -570,6 +582,14 @@ def migrate_config(raw: dict) -> bool:
         if not str(schedule_block.get("group_mode") or "").strip():
             schedule_block["group_mode"] = old_mode
         changed = True
+    # group_mode 的取值换过词：allow/deny → whitelist/blacklist → 中文。
+    # 认得出旧词才改，用户填的中文原样留着。
+    schedule_block = raw.get("schedule")
+    if isinstance(schedule_block, dict):
+        word = str(schedule_block.get("group_mode") or "").strip().lower()
+        if word in _GROUP_MODE_WORDS:
+            schedule_block["group_mode"] = _GROUP_MODE_WORDS[word]
+            changed = True
     for (section, field), (old_default, new_default) in _DEFAULT_MIGRATIONS.items():
         block = raw.get(section)
         if not isinstance(block, dict) or field not in block:

@@ -21,6 +21,8 @@ import io
 import logging
 from typing import Any
 
+from st_tieba import pick_comments
+
 logger = logging.getLogger(__name__)
 
 try:  # Pillow 是宿主自带的，缺了也能跑（只是不压缩）
@@ -63,6 +65,14 @@ html, body { background: #0e1015; }
 .st-text { font-size: 15.5px; line-height: 1.8; color: #ddd9d1; white-space: pre-wrap; word-break: break-word; }
 .st-empty { font-size: 14px; color: #75726c; font-style: italic; }
 .st-img { display: block; width: 100%; height: auto; margin-top: 12px; border-radius: 8px; }
+/* 楼中楼：贴在楼层正文下面的一条条评论 */
+.st-lzl { margin-top: 12px; padding: 10px 14px; border-left: 3px solid #ffffff1f;
+  background: #ffffff08; border-radius: 0 8px 8px 0; }
+.st-lzl-item { font-size: 13.5px; line-height: 1.7; color: #b8b4ac; }
+.st-lzl-item + .st-lzl-item { margin-top: 7px; }
+.st-lzl-name { color: #ACCENT#; font-weight: 600; }
+.st-lzl-owner { color: #ACCENT#; font-weight: 700; }
+.st-lzl-more { margin-top: 8px; font-size: 12px; color: #75726c; font-style: italic; }
 .st-foot {
   display: flex; align-items: center; justify-content: space-between;
   padding: 18px 32px 22px; font-size: 12px; color: #6f6c66;
@@ -120,6 +130,38 @@ def image_data_uri(raw: bytes, *, max_width: int = 1080, quality: int = 85) -> s
     return "data:%s;base64,%s" % (_sniff_mime(raw), base64.b64encode(raw).decode("ascii"))
 
 
+def _comments_html(floor: Any, *, limit: int = 3) -> str:
+    """把一个楼层的楼中楼画成一小块。没有评论就返回空串。
+
+    只画前 limit 条（楼主回复优先，见 st_tieba.pick_comments）。页面本身也只渲染前几条，
+    所以用 comment_total 把「还有多少条没显示」写出来，免得看着像是帖子只有两条评论。
+    """
+
+    comments = list(getattr(floor, "comments", None) or [])
+    if not comments:
+        return ""
+    shown = pick_comments(comments, limit=limit)
+    items = []
+    for item in shown:
+        name = str(getattr(item, "author", "") or "").strip() or "匿名"
+        text = str(getattr(item, "text", "") or "").strip()
+        if not text:
+            continue
+        cls = "st-lzl-owner" if getattr(item, "is_author", False) else "st-lzl-name"
+        label = _esc(name) + ("（楼主）" if getattr(item, "is_author", False) else "")
+        items.append(
+            '<div class="st-lzl-item"><span class="%s">%s</span>：%s</div>'
+
+            % (cls, label, _esc(text))
+        )
+    if not items:
+        return ""
+    total = int(getattr(floor, "comment_total", 0) or 0)
+    more = max(total - len(shown), 0)
+    tail = '<div class="st-lzl-more">还有 %d 条评论</div>' % more if more else ""
+    return '<div class="st-lzl">%s%s</div>' % ("".join(items), tail)
+
+
 def _floors_html(
     floors: list[Any], images: dict[str, str], *, max_images: int
 ) -> tuple[str, int]:
@@ -148,7 +190,9 @@ def _floors_html(
             '<span class="st-time">%s</span></div>' % (fn, _esc(author), _esc(stamp))
         )
         body = '<div class="st-text">%s</div>' % _esc(text) if text else ""
-        parts.append('<div class="st-floor">%s%s%s</div>' % (head, body, "".join(picture_html)))
+        parts.append(
+            '<div class="st-floor">%s%s%s%s</div>'
+            % (head, body, "".join(picture_html), _comments_html(floor))        )
     return "".join(parts), used
 
 
@@ -225,6 +269,13 @@ def build_thread_text(
         fn = int(getattr(floor, "fn", 0) or 0)
         author = str(getattr(floor, "author", "") or "").strip() or "匿名"
         lines.append("%d楼 %s：%s" % (fn, author, text))
+        for item in pick_comments(list(getattr(floor, "comments", None) or []), limit=3):
+            name = str(getattr(item, "author", "") or "").strip() or "匿名"
+            body = str(getattr(item, "text", "") or "").strip()
+            if not body:
+                continue
+            tag = "（楼主）" if getattr(item, "is_author", False) else ""
+            lines.append("  └ %s%s：%s" % (name, tag, body))
         if with_images:
             pics = len(list(getattr(floor, "images", None) or []))
             if pics and used < max_images:

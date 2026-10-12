@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import json as _json
 import re
 import sys as _sys
 import time
+import urllib.parse
+import uuid
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -33,6 +36,29 @@ if str(_PLUGIN_DIR) not in _sys.path:
     _sys.path.insert(0, str(_PLUGIN_DIR))
 
 _DEFAULT_FORWARD_NAME = "？！石！？"
+
+
+def _file_uri(path: Path) -> str:
+    """把本地路径转成 ``file:///`` URI。
+
+    Windows 下必须是三个斜杠（``file:///H:/...``）：NapCat 的 checkUriType 对
+    ``file:`` 开头的 URI 在 win32 上按 ``uri.slice(8)`` 取路径，正好跳过
+    ``file:///``；两斜杠也会退化成 ``slice(7)`` 而侥幸可用，但不能指望。
+    反斜杠要换成斜杠，盘符前的斜杠不能少。
+
+    路径里可能有空格或中文（主程序装在 ``D:/我的机器人/...`` 是常事），
+    而 NapCat 会对 ``file:`` 的 URI 做 ``decodeURIComponent``，所以这里必须
+    按 URL 规则转义：不转义的话空格与中文会被解成别的字节，轻则取不到图，
+    重则 ``%`` 后面跟错字符直接抛异常。斜杠与盘符冒号要留原样。
+    """
+    try:
+        resolved = Path(path).resolve()
+    except Exception:  # noqa: BLE001
+        resolved = Path(path)
+    text = str(resolved).replace("\\", "/")
+    if not text.startswith("/"):
+        text = "/" + text
+    return "file://" + urllib.parse.quote(text, safe="/:")
 
 
 def _read_manifest_version() -> str:
@@ -49,7 +75,7 @@ from maibot_sdk import Command, MaiBotPlugin, Tool  # noqa: E402
 from maibot_sdk.types import ToolParameterInfo, ToolParamType  # noqa: E402
 
 from st_card import build_thread_html, build_thread_text, image_data_uri  # noqa: E402
-from st_config import StoneConfig, resolve_forums  # noqa: E402
+from st_config import StoneConfig, in_quiet_hours, migrate_config, resolve_forums  # noqa: E402
 from st_page import build_page_html, placeholder_urls  # noqa: E402
 from st_store import StoneStore  # noqa: E402
 from st_tieba import (  # noqa: E402
@@ -102,6 +128,9 @@ _FORWARD_TIMEOUT_MS = 300_000
 _FORWARD_FRAME_BUDGET_BYTES = 6 * 1024 * 1024
 # 每个转发节点的固定开销（昵称、user_id、message_id、JSON 括号等）的粗略估值。
 _FORWARD_NODE_OVERHEAD = 256
+# 一个「本地路径引用」图片段在帧里的开销：路径字符串 + 外壳 JSON 的估值。
+# 走这条路时图片本体根本不进帧，所以只有这点字节要算。
+_PATH_SEGMENT_COST = 512
 
 # 只搬哪种帖：列表页只能看出「有没有 media_flash」，但那只标记了首楼，
 # 楼中楼里的视频看不出来，所以过滤放在取到详情之后按真实解析结果做。
@@ -165,6 +194,31 @@ _PAGE_RENDER_SCALES = (2.0, 1.5, 1.25, 1.0)
 _RENDER_RPC_SLACK_MS = 15_000
 # 自绘卡片是本地 HTML（不联网），渲染快得多，给 45 秒足够。
 _CARD_RENDER_TIMEOUT_MS = 45_000
+
+# 长图落盘目录（插件 data 目录下的 pages/）。
+#
+# 为什么要把长图写进文件、而不是直接把 base64 塞进转发节点：
+# 整条合并转发是**一个** RPC 帧，上限 16MB（宿主 transport/base.py 的
+# MAX_FRAME_SIZE）。base64 进帧还要被宿主存两份，于是「一张 6MB 的长图就吃掉
+# 整条预算」，后面的帖子只能被踢出去单独发 —— 用户看到的就是刷屏。
+#
+# 改成让节点只带一个本地路径后，帧里就只有两百来字节，**与图片体积无关**：
+# 实测 4 张各 6MB 的长图（合计 23.4MB）进同一条转发，插件发出的帧仍只有 1.4KB。
+# 这条路能成是因为 NapCat 的 uriToLocalFile 明确认 file:// 前缀
+# （napcat.mjs 的 checkUriType：`uri.startsWith("file:")` -> Local，且本地文件
+# 原样使用不复制），已在 chatbot 测试组真机验证。
+_PAGE_CACHE_FILENAME = "page_%s_%d.png"
+# 落盘的长图保留份数：只留最近这些张，避免长年累月把磁盘塞满。
+# 转发是异步投递的，删太早会让 QQ 那边取不到图，所以按「张数」而不是「时间」清。
+_PAGE_CACHE_KEEP = 60
+# 给协议端留出的读文件时间：刚落盘的图在这一段时间内绝不删。
+# NapCat 收到 file:// 之后要自己去读盘再上传，这条转发是异步投递的，
+# 上一张贴出去、下一轮马上开始清理时，前面那张可能还没被读完。
+_PAGE_CACHE_CLEAN_DELAY_S = 600.0
+# 清理节流：一轮搬运会落盘上百张小图，每张都去 glob 一遍整个目录太浪费
+# （目录常驻几十个文件，一轮下来就是上万次同步 stat，还会卡住事件循环）。
+# 改成每隔这么多秒最多真正扫一次目录。
+_PAGE_CACHE_PRUNE_INTERVAL_S = 30.0
 
 # 维护类子命令的拒绝文案，只放管理员
 _MAINTENANCE_DENIED = (
@@ -466,6 +520,8 @@ class StonePlugin(MaiBotPlugin):
         self._seen_message_ids: deque[str] = deque(maxlen=64)
         # 工具调用期间临时指定的「只搬哪种帖」；空串表示照配置走
         self._kind_override: str = ""
+        # 上次真正扫过落盘目录的时刻，用来节流清理（落盘很频繁，扫目录很贵）
+        self._page_cache_pruned_at: float = 0.0
         self._setup()
         cfg = self.config
         self.ctx.logger.info(
@@ -487,6 +543,14 @@ class StonePlugin(MaiBotPlugin):
             await self._client.aclose()
             self._client = None
         self.ctx.logger.info("[搬石] 已卸载")
+
+    def normalize_plugin_config(self, config_data):
+        # 面板默认值改过之后，老 config.toml 里那个键还留着旧默认（比如空的屏蔽词列表），
+        # 而宿主补齐/归一化都是「键存在就用旧值」，于是新默认永远盖不上去。
+        # 先按迁移表把「没动过」的字段换成新默认，再走 SDK 原本的校验补齐。
+        changed = migrate_config(config_data) if isinstance(config_data, dict) else False
+        normalized, auto_changed = super().normalize_plugin_config(config_data)
+        return normalized, bool(changed or auto_changed)
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         del config_data
@@ -514,6 +578,71 @@ class StonePlugin(MaiBotPlugin):
             base = _PLUGIN_DIR / "data"
         base.mkdir(parents=True, exist_ok=True)
         return base
+
+    def _page_cache_dir(self) -> Path:
+        """长图落盘目录。转发节点里放的是这里的 file:// 路径。"""
+        base = self._data_dir() / "pages"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+
+    def _save_page_image(self, image_b64: str) -> str:
+        """把渲染好的长图写进落盘目录，返回 ``file:///`` 形式的绝对路径。
+
+        写盘失败时返回空串，调用方据此退回 base64 —— 路径引用只是「省帧体积」，
+        不该因为磁盘只读之类的小事让整条帖子发不出去。
+        """
+        return self._save_blob_image(image_b64, log_failure=True)
+
+    def _save_blob_image(self, image_b64: str, *, log_failure: bool = False) -> str:
+        """把一段 base64 图片写盘并返回 ``file:///`` 路径；失败返回空串。
+
+        正文小图用同一个目录：它们和长图一样都只是「给协议端读的临时文件」，
+        按同一个份数上限一起清理即可。
+        """
+        try:
+            data = base64.b64decode(image_b64)
+        except Exception:  # noqa: BLE001
+            return ""
+        try:
+            directory = self._page_cache_dir()
+            path = directory / (_PAGE_CACHE_FILENAME % (uuid.uuid4().hex, int(time.time())))
+            path.write_bytes(data)
+        except Exception as exc:  # noqa: BLE001
+            if log_failure:
+                self.ctx.logger.warning("[搬石] 长图落盘失败，这条改用内嵌图片：%s", exc)
+            return ""
+        self._prune_page_cache()
+        return _file_uri(path)
+
+    def _prune_page_cache(self, *, keep: int | None = None) -> None:
+        """只留最近 ``keep`` 张落盘图片，多出来的按修改时间从旧到新删掉。
+
+        两个约束：
+        * ``_PAGE_CACHE_CLEAN_DELAY_S`` 之内的文件一律不碰 —— 协议端可能正读着；
+        * 每 ``_PAGE_CACHE_PRUNE_INTERVAL_S`` 秒最多真扫一次目录，否则一轮上百张
+          小图会把同步 stat 打成几万次，白堵事件循环。
+        """
+        limit = _PAGE_CACHE_KEEP if keep is None else keep
+        now = time.time()
+        # getattr 兜底：清理只是维护动作，不该因为实例状态缺失把整轮搬运带崩
+        last = float(getattr(self, "_page_cache_pruned_at", 0.0) or 0.0)
+        if now - last < _PAGE_CACHE_PRUNE_INTERVAL_S:
+            return
+        self._page_cache_pruned_at = now
+        try:
+            files = sorted(
+                self._page_cache_dir().glob("page_*.png"),
+                key=lambda item: item.stat().st_mtime,
+            )
+        except Exception:  # noqa: BLE001
+            return
+        # 保护期内（刚落盘、协议端可能还没读完）的一律留下，不参与淘汰。
+        files = [item for item in files if now - item.stat().st_mtime >= _PAGE_CACHE_CLEAN_DELAY_S]
+        for stale in files[: max(0, len(files) - limit)]:
+            try:
+                stale.unlink()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _setup(self) -> None:
         cfg = self.config
@@ -761,6 +890,17 @@ class StonePlugin(MaiBotPlugin):
             except asyncio.CancelledError:
                 raise
             started_at = time.monotonic()
+            # 免打扰时段：跳过这一轮，不补发。排期本身照旧往下走 —— 醒来时若还在
+            # 时段内就整轮丢掉，等下一个网格点；醒来已在时段外就正常搬。
+            if in_quiet_hours(self.config.schedule):
+                self.ctx.logger.info(
+                    "[搬石] 当前在免打扰时段（%s~%s），跳过本轮",
+                    self.config.schedule.quiet_start,
+                    self.config.schedule.quiet_end,
+                )
+                if not fixed:
+                    pending = self._interval_wait(started_at)
+                continue
             try:
                 if post_at is not None:
                     self.ctx.logger.info(
@@ -868,6 +1008,7 @@ class StonePlugin(MaiBotPlugin):
                         thread,
                         max_floors=int(cfg.fetch.max_floors),
                         max_chars=int(cfg.fetch.max_chars),
+                        max_comments=int(getattr(cfg.fetch, "max_comments", 3) or 0),
                     )
                 except StoneBlockedError as exc:
                     blocked = str(exc)
@@ -1009,6 +1150,9 @@ class StonePlugin(MaiBotPlugin):
             budget = max(want, want * _FILTER_CANDIDATE_FACTOR)
         store = self._store
         keywords = [str(word).strip().lower() for word in cfg.block_keywords if str(word).strip()]
+        min_agree = int(getattr(cfg, "min_agree", 0) or 0)
+        # 这一页有没有读到过点赞数：全是 0 就当作没读到，别把解析失败当成「零赞」。
+        page_has_agree = any(int(getattr(x, "agree", 0) or 0) > 0 for x in threads)
         picked: list[Any] = []
         # 收满 budget 就够了。这里**不**替 _run_locked 的复核收窄候选：「只要视频帖」
         # 时列表页标记偶尔失准（视频帖被标成 0），多留几倍正是为了在复核阶段捞回来；
@@ -1018,6 +1162,12 @@ class StonePlugin(MaiBotPlugin):
                 continue
             if int(getattr(thread, "replies", 0) or 0) < int(cfg.min_replies):
                 continue
+            # 点赞数只有列表页内联 JSON 里有，读不到时字段就是 0。
+            # 但 0 既可能是「真的零赞」也可能是「没解析到」；对置顶/公告这类帖子，
+            # 当成零赞筛掉是错的 —— 所以只在**这一页确实读到过**点赞数据时才按它筛。
+            if min_agree > 0 and page_has_agree:
+                if int(getattr(thread, "agree", 0) or 0) < min_agree:
+                    continue
             title = str(getattr(thread, "title", "") or "").lower()
             if any(word in title for word in keywords):
                 continue
@@ -1455,8 +1605,13 @@ class StonePlugin(MaiBotPlugin):
 
     async def _card_images(
         self, thread: Any, detail: Any, payload: dict[str, Any]
-    ) -> tuple[list[str], str]:
-        """把一条帖子渲染成长图；返回 (base64 列表, 渲染不出来时的退回文本)。"""
+    ) -> tuple[list[str], list[str], str]:
+        """把一条帖子渲染成长图；返回 (base64 列表, 落盘路径列表, 渲染不出来时的退回文本)。
+
+        两个列表一一对应：``paths[i]`` 是 ``images[i]`` 落盘后的 ``file://`` 路径，
+        落盘失败时对应项是空串。转发节点优先用路径（帧里只有两百来字节、与图片
+        体积无关），路径为空才退回 base64。
+        """
         cfg = self._send_options()
         if _card_style(cfg) == _CARD_STYLE_PAGE:
             raw_html = str(getattr(detail, "raw", "") or "")
@@ -1468,9 +1623,9 @@ class StonePlugin(MaiBotPlugin):
                 )
                 image_b64 = await self._render_page(html)
                 if image_b64:
-                    return [image_b64], ""
+                    return [image_b64], [self._save_page_image(image_b64)], ""
                 self.ctx.logger.warning("[搬石] 原页面长图渲染失败，这条退回文本")
-                return [], build_thread_text(
+                return [], [], build_thread_text(
                     thread, detail.floors, max_images=int(cfg.max_images)
                 )
             self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
@@ -1481,8 +1636,9 @@ class StonePlugin(MaiBotPlugin):
         floor_images = _select_floor_images(floors, uris, int(cfg.max_images))
         chunks = _plan_card_chunks(floors, sizes, width, floor_images)
         if not chunks:
-            return [], ""
+            return [], [], ""
         images: list[str] = []
+        paths: list[str] = []
         for index, chunk in enumerate(chunks):
             segment = _seg_images(chunk, floors, floor_images, uris)
             html = build_thread_html(
@@ -1522,11 +1678,12 @@ class StonePlugin(MaiBotPlugin):
             if not image_b64:
                 # 渲染不出来不能什么都不发：退回纯文本
                 self.ctx.logger.warning("[搬石] 长图渲染失败或太大，这条退回文本")
-                return [], build_thread_text(
+                return [], [], build_thread_text(
                     thread, detail.floors, max_images=int(cfg.max_images)
                 )
             images.append(image_b64)
-        return images, ""
+            paths.append(self._save_page_image(image_b64))
+        return images, paths, ""
 
     async def _render_page(self, html: str) -> str:
         """把整页 HTML 交给宿主渲染器截成一张长图；失败返回空串。
@@ -1632,13 +1789,34 @@ class StonePlugin(MaiBotPlugin):
     async def _send_cards(
         self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
     ) -> None:
-        images, fallback = await self._card_images(thread, detail, payload)
+        images, paths, fallback = await self._card_images(thread, detail, payload)
         if not images:
             if fallback:
                 await self.ctx.send.text(fallback, stream_id, storage_message=False)
             return
-        for image_b64 in images:
-            await self.ctx.send.image(image_b64, stream_id, storage_message=False)
+        for index, image_b64 in enumerate(images):
+            # 单独发长图时也优先用落盘路径：走 base64 的话一张图就要过一次
+            # 16MB 的 RPC 帧，路径只有两百来字节。路径为空才退回内嵌。
+            page = paths[index] if index < len(paths) else ""
+            await self._send_page_image(stream_id, page, image_b64)
+
+    async def _send_page_image(self, stream_id: str, page_uri: str, image_b64: str) -> None:
+        """发一张长图：有落盘路径就走路径，否则退回内嵌 base64。"""
+        if page_uri:
+            try:
+                sent = await self.ctx.send.custom(
+                    "imageurl",
+                    {"file": page_uri},
+                    stream_id,
+                    storage_message=False,
+                    timeout_ms=_VIDEO_SEND_TIMEOUT_MS,
+                )
+                if sent is not False:
+                    return
+                self.ctx.logger.warning("[搬石] 长图按本地路径发送没成功，改用内嵌图片")
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("[搬石] 长图按本地路径发送失败，改用内嵌图片：%s", exc)
+        await self.ctx.send.image(image_b64, stream_id, storage_message=False)
 
     async def _send_plain(
         self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
@@ -1706,30 +1884,50 @@ class StonePlugin(MaiBotPlugin):
             header_cost = len(str(header.get("data") or "")) + _FORWARD_NODE_OVERHEAD
             used_bytes += header_cost
             if cfg.send_card:
-                images, fallback = await self._card_images(thread, detail, payload)
-                cost = sum(len(b64) for b64 in images)
-                if images and used_bytes + cost > budget:
-                    # 长图一张就把预算吃掉一大块。这帖整帖退出去单独发：
-                    # 长图和正文都还在，只是不再留在聊天记录里。
-                    self.ctx.logger.info(
-                        "[搬石] 第 %s 帖的长图装不下这条聊天记录了（%d 字节），这帖改单独发",
-                        thread.tid,
-                        cost,
-                    )
-                    del nodes[first:]
-                    used_bytes -= header_cost
-                    deferred.append((thread, detail))
-                    continue
+                images, paths, fallback = await self._card_images(thread, detail, payload)
                 if images:
-                    used_bytes += cost
-                if images:
+                    # 长图优先用「本地路径引用」：节点里只放一个 file:// 路径，
+                    # 帧里是两百来字节，**与图片有多大无关**。这样一张 6MB 的长图
+                    # 不再吃掉整条预算，后面的帖子也不必被踢出去单独发。
+                    # 落盘失败（paths 对应项为空串）才退回内嵌 base64。
+                    segments: list[dict[str, Any]] = []
+                    embedded_cost = 0
+                    for index, b64 in enumerate(images):
+                        page = paths[index] if index < len(paths) else ""
+                        if page:
+                            segments.append(
+                                {
+                                    "type": "dict",
+                                    "data": {
+                                        "type": "imageurl",
+                                        "data": {"file": page},
+                                    },
+                                }
+                            )
+                            # 路径段的帧开销虽然只有两百来字节，但也得记账，
+                            # 否则预算算的是「内嵌部分」而不是「整条节点」。
+                            embedded_cost += _PATH_SEGMENT_COST
+                        else:
+                            segments.append({"type": "image", "content": b64})
+                            embedded_cost += len(b64)
+                    if used_bytes + embedded_cost > budget:
+                        # 只在内嵌兜底时才会撞预算。这帖整帖退出去单独发：
+                        # 长图和正文都还在，只是不再留在聊天记录里。
+                        self.ctx.logger.info(
+                            "[搬石] 第 %s 帖的长图装不下这条聊天记录了（%d 字节），这帖改单独发",
+                            thread.tid,
+                            embedded_cost,
+                        )
+                        del nodes[first:]
+                        used_bytes -= header_cost
+                        deferred.append((thread, detail))
+                        continue
+                    used_bytes += embedded_cost
                     nodes.append(
                         {
                             "nickname": self._forward_name(),
                             "user_id": "",
-                            "segments": [
-                                {"type": "image", "content": b64} for b64 in images
-                            ],
+                            "segments": segments,
                         }
                     )
                 elif fallback:
@@ -1764,6 +1962,17 @@ class StonePlugin(MaiBotPlugin):
                 for url in list(floor.images or []):
                     blob = blobs.get(url)
                     if not blob:
+                        continue
+                    # 正文小图同样优先落盘走路径：省下的不只是这几百 KB，
+                    # 更是「一张大图吃掉整条预算」的连锁反应。落盘失败才内嵌。
+                    page = self._save_blob_image(blob)
+                    if page:
+                        segments.append(
+                            {
+                                "type": "dict",
+                                "data": {"type": "imageurl", "data": {"file": page}},
+                            }
+                        )
                         continue
                     # 图片段的 base64 必须放在 content 里：宿主按 content 写
                     # binary_data_base64。装不下就丢掉这一张，后面更小的兴许还塞得进。

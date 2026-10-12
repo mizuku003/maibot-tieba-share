@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from maibot_sdk import Field, PluginConfigBase
@@ -45,7 +46,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.0.2",
+        default="1.0.4",
         description="配置版本号，请勿手动修改",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
@@ -107,13 +108,20 @@ class StoneSection(PluginConfigBase):
         description="只搬回复数不少于多少的帖子",
         json_schema_extra={"label": "最少回复数", "hint": "回复数低于此值的帖子不搬；0 = 不限"},
     )
+    min_agree: int = Field(
+        default=10,
+        ge=0,
+        le=100000,
+        description="只搬点赞数不少于多少的帖子",
+        json_schema_extra={"label": "最少点赞数", "hint": "点赞低于此值的帖子不搬；0 = 不限"},
+    )
     skip_top: bool = Field(
         default=True,
         description="跳过置顶帖",
         json_schema_extra={"label": "跳过置顶帖", "hint": "不搬吧内置顶帖"},
     )
     block_keywords: list[str] = Field(
-        default_factory=list,
+        default_factory=lambda: ["水贴", "水楼", "+3"],
         description="标题里含这些词就不搬（一行一个）",
         json_schema_extra={"label": "标题屏蔽词", "hint": "标题含这些词的帖子不搬；留空 = 不屏蔽"},
     )
@@ -195,6 +203,22 @@ class ScheduleSection(PluginConfigBase):
         json_schema_extra={
             "label": "每天定点",
             "hint": "每天几点搬，如 09:30、21:00，一行一个",
+        },
+    )
+    quiet_start: str = Field(
+        default="23:00",
+        description="免打扰开始时刻",
+        json_schema_extra={
+            "label": "免打扰开始",
+            "hint": "格式 HH:MM；留空 = 不启用免打扰。默认 23:00~08:00 深夜不发",
+        },
+    )
+    quiet_end: str = Field(
+        default="08:00",
+        description="免打扰结束时刻",
+        json_schema_extra={
+            "label": "免打扰结束",
+            "hint": "格式 HH:MM；支持跨午夜。默认 23:00~08:00 深夜不发",
         },
     )
 
@@ -341,6 +365,16 @@ class FetchSection(PluginConfigBase):
         description="单层正文最多留几个字",
         json_schema_extra={"label": "单层最多留几个字", "hint": "单层文字最多留几个字；0 = 不截断"},
     )
+    max_comments: int = Field(
+        default=3,
+        ge=0,
+        le=20,
+        description="每层最多带几条楼中楼",
+        json_schema_extra={
+            "label": "每层带几条评论",
+            "hint": "每层正文下最多挂几条评论（楼主回复优先）；0 = 不带评论",
+        },
+    )
     delay_seconds: float = Field(
         default=3.0,
         ge=0.0,
@@ -468,3 +502,66 @@ class StoneConfig(PluginConfigBase):
     send: SendSection = Field(default_factory=SendSection)
     tool: ToolSection = Field(default_factory=ToolSection)
     fetch: FetchSection = Field(default_factory=FetchSection)
+
+
+# 面板默认值改过、但老配置里那个键还留着旧值的，在这里按「旧值 → 新值」补一次。
+# 为什么要这层：宿主升级配置时是按「新默认当骨架、旧值盖上去」，而空列表和三个词的列表
+# 都是 list，类型检查放行，于是老配置里的 block_keywords = [] 会一直把新默认盖掉；
+# 用户自己填过的词当然要留，所以只在「旧值恰好等于旧默认」时才视为没动过、替换成新默认。
+# 字符串字段同理（quiet_start / quiet_end 这类）。
+_DEFAULT_MIGRATIONS: dict[tuple[str, str], tuple[object, object]] = {
+    ("stone", "block_keywords"): ([], list(StoneSection.model_fields["block_keywords"].default_factory())),
+    ("schedule", "quiet_start"): ("", "23:00"),
+    ("schedule", "quiet_end"): ("", "08:00"),
+}
+
+
+def migrate_config(raw: dict) -> bool:
+    """把老配置里「没动过、但默认值已经变了」的字段换成新默认，返回是否改过。"""
+
+    changed = False
+    for (section, field), (old_default, new_default) in _DEFAULT_MIGRATIONS.items():
+        block = raw.get(section)
+        if not isinstance(block, dict) or field not in block:
+            continue
+        if block[field] != old_default:
+            # 用户自己填过，保持原样
+            continue
+        block[field] = list(new_default) if isinstance(new_default, list) else new_default
+        changed = True
+    return changed
+
+
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    """把 HH:MM 解析成 (时, 分)；兼容 9:00 这类没补零的写法，解析不了返回 None。"""
+
+    parts = str(value or "").strip().split(":")
+    if len(parts) != 2:
+        return None
+    head, tail = parts[0].strip(), parts[1].strip()
+    if not head.isdigit() or not tail.isdigit():
+        return None
+    hour, minute = int(head), int(tail)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
+def in_quiet_hours(section: "ScheduleSection", now: "datetime | None" = None) -> bool:
+    """当前是否落在免打扰时段里。两端都填了才生效，支持跨午夜。"""
+
+    start = _parse_hhmm(getattr(section, "quiet_start", ""))
+    end = _parse_hhmm(getattr(section, "quiet_end", ""))
+    if start is None or end is None:
+        return False
+    if start == end:
+        # 首尾相同视为「全天免打扰」太反直觉，按不启用处理
+        return False
+    current = now or datetime.now()
+    now_minutes = current.hour * 60 + current.minute
+    start_minutes = start[0] * 60 + start[1]
+    end_minutes = end[0] * 60 + end[1]
+    if start_minutes < end_minutes:
+        return start_minutes <= now_minutes < end_minutes
+    # 跨午夜，如 23:00 ~ 08:00
+    return now_minutes >= start_minutes or now_minutes < end_minutes

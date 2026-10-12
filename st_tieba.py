@@ -122,6 +122,8 @@ _TITLE_RE = re.compile(r'<div[^>]*class="[^"]*\bti_title\b[^"]*"[^>]*>(?P<body>.
 # 帖子类型：40 = 视频帖（实测与列表项里的 media_flash 标记严格对应）
 THREAD_TYPE_VIDEO = 40
 _THREAD_TYPE_RE = re.compile(r'data-thread-type="(?P<t>\d+)"')
+# 列表页内联的帖子 JSON 数组：{"id":<tid>,"tid":<tid>,"title":…
+_LIST_JSON_HEAD_RE = re.compile(r'\{"id":(\d+),"tid":\1,"title":')
 _SPAN_RE = re.compile(r"<span[^>]*>(?P<text>.*?)</span>", re.S)
 
 # 回复数：<div class="ti_zan_reply ..."><div class="ti_func_btn btn_reply">
@@ -194,6 +196,21 @@ _NAG_RE = re.compile(
     re.M | re.I,
 )
 
+
+def _to_int(value: object, default: int = 0) -> int:
+    """把 JSON 里的数字/数字字符串转成 int，转不了就用默认值。"""
+
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        # JSON 里的 agree_num 偶尔是 12.0 这种浮点，能取整就别丢
+        return int(value)
+    try:
+        return int(str(value).strip() or default)
+    except (TypeError, ValueError):
+        return default
 
 def _text_of(raw: str) -> str:
     """把一段 HTML 片段变成可读文本：去标签、还原实体、压空白。"""
@@ -420,6 +437,20 @@ def images_of(segment: str) -> tuple[list[str], list[str]]:
 
 
 @dataclass
+class StoneComment:
+    """楼层下的一条楼中楼（评论）。
+
+    贴吧页面给每条评论的只有 pid 和作者名 —— 没有点赞数、没有时间、没有楼中楼层号
+    （实测 55 个样本，含楼中楼的面板里 agree/zan/j_agree 命中数全是 0）。所以没法按
+    「高赞」排序，只能靠「是不是楼主」和页面顺序来挑。
+    """
+
+    author: str = ""
+    text: str = ""
+    is_author: bool = False
+
+
+@dataclass
 class StoneVideo:
     """楼层里的一个视频。
 
@@ -494,6 +525,10 @@ class StoneThread:
     # div.media_flash 标记 100% 一致（视频吧/搬石吧/孙笑川吧各 30 条零分歧），
     # 所以不用为了筛视频去抓详情页。
     thread_type: int = 0
+    # 列表页内联 JSON 里的点赞数与浏览量（详情页没有这两个数）。
+    # 页面结构变了就都是 0，筛选端要把它当成「不知道」而不是「零赞」。
+    agree: int = 0
+    views: int = 0
 
     @property
     def has_video(self) -> bool:
@@ -521,6 +556,9 @@ class StoneFloor:
     images: list[str] = field(default_factory=list)
     thumbs: list[str] = field(default_factory=list)
     videos: list[StoneVideo] = field(default_factory=list)
+    # 楼中楼：页面只渲染前几条，comment_total 是真实总数（data-list-count）。
+    comments: list[StoneComment] = field(default_factory=list)
+    comment_total: int = 0
 
 
 @dataclass
@@ -556,6 +594,180 @@ def normalize_forum(name: str) -> str:
     return str(name or "").strip().strip("/／").strip()
 
 
+# 楼中楼面板：<div class="fr_list 2 j_floor_panel" data-list-count="27">…</div>。
+# 它是 div.content 的**兄弟**节点，所以从整段楼层片段里单独抓不会跟正文打架。
+# 开标签要单独抓：面板体里嵌着 fmain/floor_footer_item 好几个 div，用非贪婪
+# 正则配 </div> 会在第一个内层 div 就截断，必须按 div 配平扫。
+_LZL_OPEN_RE = re.compile(r'<div[^>]*class="[^"]*\bj_floor_panel\b[^"]*"[^>]*>', re.S)
+_LZL_DIV_OPEN_RE = re.compile(r"<div\b", re.I)
+_LZL_DIV_CLOSE_RE = re.compile(r"</div>", re.I)
+_LZL_COUNT_RE = re.compile(r'data-list-count="(?P<num>\d+)"')
+_LZL_ITEM_RE = re.compile(
+    r'<li[^>]*\bpid="(?P<pid>\d+)"[^>]*class="[^"]*\bj_list_item_floor\b[^"]*"[^>]*>(?P<body>.*?)</li>',
+    re.S,
+)
+_LZL_AUTHOR_RE = re.compile(r'class="[^"]*\buser_name\b[^"]*"[^>]*>(?P<name>.*?)</a>', re.S)
+_LZL_TEXT_RE = re.compile(r'<span[^>]*class="[^"]*\bfloor_content\b[^"]*"[^>]*>(?P<text>.*?)</span>', re.S)
+
+
+def _lzl_panel_of(body: str) -> tuple[str, int]:
+    """从一段楼层片段里取出楼中楼面板的 HTML 与真实评论总数。
+
+    Returns:
+        (面板 HTML, data-list-count)。没有面板就返回 ("", 0)。
+    """
+
+    match = _LZL_OPEN_RE.search(body or "")
+    if match is None:
+        return "", 0
+    count_m = _LZL_COUNT_RE.search(body[match.start() : match.end()])
+    try:
+        total = int(count_m.group("num")) if count_m else 0
+    except (TypeError, ValueError):
+        total = 0
+    # 从开标签之后按 <div>/</div> 配平，取到面板闭合为止（面板体里还有嵌套 div）
+    panel = body[match.end() : _lzl_close_index(body, match.end())]
+    return panel, total
+
+
+def _lzl_close_index(body: str, start: int) -> int:
+    """从 start 起按 div 配平，返回面板闭合标签的起始下标；配不平就返回 len(body)。"""
+
+    depth = 1
+    index = start
+    length = len(body)
+    while index < length:
+        open_m = _LZL_DIV_OPEN_RE.search(body, index)
+        close_m = _LZL_DIV_CLOSE_RE.search(body, index)
+        if close_m is None:
+            return length
+        if open_m is not None and open_m.start() < close_m.start():
+            depth += 1
+            index = open_m.end()
+            continue
+        depth -= 1
+        if depth == 0:
+            return close_m.start()
+        index = close_m.end()
+    return length
+
+
+def parse_comments(panel: str, *, author: str = "", limit: int = 0) -> list[StoneComment]:
+    """解析一个楼中楼面板。
+
+    页面只渲染前几条评论（其余被折叠成「打开APP查看N条评论」），所以返回的是子集。
+    贴吧没给评论点赞数，无法按赞排序，调用方只能按「是不是楼主」和页面顺序挑。
+
+    Args:
+        panel: _lzl_panel_of 取出来的面板 HTML。
+        author: 该楼层的作者，用来标记哪些评论是楼主自己回的。
+        limit: 最多返回几条（0 表示不限制）。
+    """
+
+    out: list[StoneComment] = []
+    owner = str(author or "").strip()
+    for item in _LZL_ITEM_RE.finditer(panel or ""):
+        seg = item.group("body")
+        text_m = _LZL_TEXT_RE.search(seg)
+        if text_m is None:
+            continue
+        text = _clean_text(_text_of(text_m.group("text")))
+        if not text:
+            continue
+        name_m = _LZL_AUTHOR_RE.search(seg)
+        # 昵称节点里可能嵌 nickemoji 的 <img>，末尾还带一个冒号，都要清掉
+        name = _clean_text(_text_of(name_m.group("name"))) if name_m else ""
+        name = name.rstrip(":").strip()
+        out.append(
+            StoneComment(
+                author=name,
+                text=text,
+                is_author=bool(owner) and name == owner,
+            )
+        )
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def pick_comments(comments: Sequence[StoneComment], *, limit: int = 3) -> list[StoneComment]:
+    """从楼中楼里挑要展示的几条：楼主自己的回复优先，其余按页面顺序。
+
+    之所以是「楼主优先」而不是「高赞优先」：贴吧页面根本没给评论点赞数（见 StoneComment）。
+    楼主回复通常才是补充说明/纠错，信息量最大，放前面最有用。
+    """
+
+    if limit <= 0:
+        return list(comments)
+    mine = [c for c in comments if c.is_author]
+    others = [c for c in comments if not c.is_author]
+    return (mine + others)[:limit]
+
+
+def _scan_json_object(raw: str, start: int) -> tuple[str, int]:
+    """从 start 处的 `{` 起配平到对应 `}`，返回 (对象文本, 结束下标)。字符串里的花括号不算数。"""
+
+    depth = 0
+    in_str = False
+    escaped = False
+    index = start
+    while index < len(raw):
+        ch = raw[index]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return raw[start : index + 1], index + 1
+        index += 1
+    return "", -1
+
+
+def _list_page_stats(raw: str) -> dict[str, tuple[int, int]]:
+    """从列表页内联的帖子 JSON 里取 {tid: (点赞数, 浏览量)}。
+
+    详情页没有帖子级点赞数，只有列表页这段 JSON 有，所以必须在这儿取 ——
+    好在列表页本来就要抓，等于零额外请求。取不到就返回空表，调用方按「不知道」处理。
+    """
+
+    out: dict[str, tuple[int, int]] = {}
+    match = _LIST_JSON_HEAD_RE.search(raw or "")
+    if match is None:
+        return out
+    index = match.start()
+    length = len(raw)
+    while index < length and raw[index] == "{":
+        body, end = _scan_json_object(raw, index)
+        if not body:
+            break
+        try:
+            item = json.loads(body)
+        except (ValueError, TypeError):
+            # 页面结构变了就整段放弃，别拿半截数据去筛帖
+            break
+        tid = str(item.get("tid") or "")
+        if tid:
+            agree = item.get("agree")
+            if isinstance(agree, dict):
+                likes = _to_int(agree.get("agree_num"))
+            else:
+                likes = _to_int(agree)
+            out[tid] = (likes, _to_int(item.get("view_num")))
+        index = end
+        while index < length and raw[index] in ", \t\r\n":
+            index += 1
+    return out
+
+
 def parse_thread_list(raw: str, *, forum: str = "") -> list[StoneThread]:
     """解析 m 站列表页。
 
@@ -575,6 +787,7 @@ def parse_thread_list(raw: str, *, forum: str = "") -> list[StoneThread]:
     """
     out: list[StoneThread] = []
     seen: set[str] = set()
+    stats = _list_page_stats(raw or "")
     for m in _LIST_ITEM_RE.finditer(raw or ""):
         tid = m.group("tid")
         if tid in seen:
@@ -590,6 +803,7 @@ def parse_thread_list(raw: str, *, forum: str = "") -> list[StoneThread]:
             continue
         is_top = "tl_top" in m.group(0)[: max(0, m.group(0).find(">"))]
         tt = _THREAD_TYPE_RE.search(m.group(0)[: max(0, m.group(0).find(">"))])
+        likes, views = stats.get(tid, (0, 0))
         out.append(
             StoneThread(
                 tid=tid,
@@ -598,12 +812,16 @@ def parse_thread_list(raw: str, *, forum: str = "") -> list[StoneThread]:
                 is_top=is_top,
                 replies=_reply_count_of(body),
                 thread_type=int(tt.group("t")) if tt else 0,
+                agree=likes,
+                views=views,
             )
         )
     return out
 
 
-def parse_floors(raw: str, *, max_floors: int = 30, max_chars: int = 0) -> list[StoneFloor]:
+def parse_floors(
+    raw: str, *, max_floors: int = 30, max_chars: int = 0, max_comments: int = 0
+) -> list[StoneFloor]:
     """解析 kz= 帖子页的首页楼层。
 
     楼层以 li 标签上的 tid 数字开头，一直到一个同形状的 li 标签为止。
@@ -612,6 +830,8 @@ def parse_floors(raw: str, *, max_floors: int = 30, max_chars: int = 0) -> list[
     Args:
         max_floors: 最多返回几层（0 表示不限制）。
         max_chars: 单层正文最多留几个字（0 表示不截断）。
+        max_comments: 每层最多解析几条楼中楼；**0 表示不解析**（页面本来就只给前几条，
+            全解析没意义，所以这里的 0 跟 max_floors 的 0 语义不同）。
     """
     marks = list(_FLOOR_OPEN_RE.finditer(raw or ""))
     out: list[StoneFloor] = []
@@ -666,15 +886,20 @@ def parse_floors(raw: str, *, max_floors: int = 30, max_chars: int = 0) -> list[
                 ]
                 origin = [o for o, _t in kept]
                 thumbs = [t for _o, t in kept]
+        author = str(info.get("name_show") or info.get("un") or "").strip()
+        # 楼中楼：面板是 content 的兄弟节点，单独从整段楼层片段里取
+        panel, comment_total = _lzl_panel_of(body)
         out.append(
             StoneFloor(
                 fn=fn or (idx + 1),
-                author=str(info.get("name_show") or info.get("un") or "").strip(),
+                author=author,
                 text=text,
                 time=time_text,
                 images=origin,
                 thumbs=thumbs,
                 videos=videos,
+                comments=parse_comments(panel, author=author, limit=max_comments) if max_comments else [],
+                comment_total=comment_total,
             )
         )
         if max_floors and len(out) >= max_floors:
@@ -892,6 +1117,7 @@ class StoneTiebaClient:
         *,
         max_floors: int = 30,
         max_chars: int = 0,
+        max_comments: int = 3,
     ) -> StoneDetail:
         """抓一个帖子的首页楼层（免登录）。"""
         referer = (
@@ -911,7 +1137,9 @@ class StoneTiebaClient:
         if raw is None:
             return detail
         detail.raw = raw
-        detail.floors = parse_floors(raw, max_floors=max_floors, max_chars=max_chars)
+        detail.floors = parse_floors(
+            raw, max_floors=max_floors, max_chars=max_chars, max_comments=max_comments
+        )
         if not detail.floors:
             logger.debug("[搬石/贴吧] 帖子 %s 没解析出楼层（可能被删/结构变了）", thread.tid)
         return detail

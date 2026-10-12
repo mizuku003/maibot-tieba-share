@@ -628,6 +628,24 @@ class _SendGate:
         return False
 
 
+class _RoundSummary(str):
+    """一轮搬石的结果。
+
+    **是 ``str`` 的子类**：摘要要写进日志、要能被直接打印、探针本来也按字符串
+    比对，所以本体必须还是字符串；「该不该发到群里」另由 ``error`` 表达。
+
+    只有出错才值得说话。成功是常态 —— 帖子本身已经发进群了，再补一句
+    「本轮搬了 N 条」没有任何信息量，只是刷屏。
+    """
+
+    __slots__ = ("error",)
+
+    def __new__(cls, text: str, *, error: bool = False) -> "_RoundSummary":
+        obj = super().__new__(cls, text)
+        obj.error = error
+        return obj
+
+
 class StonePlugin(MaiBotPlugin):
     """麦麦贴吧搬石插件。"""
 
@@ -1111,7 +1129,7 @@ class StonePlugin(MaiBotPlugin):
         try:
             await asyncio.wait_for(self._lock.acquire(), timeout=0.01)
         except (asyncio.TimeoutError, TimeoutError):
-            return "上一轮还没跑完，这次跳过"
+            return _RoundSummary("上一轮还没跑完，这次跳过")
         try:
             cfg = self.config
             client = self._client
@@ -1121,7 +1139,7 @@ class StonePlugin(MaiBotPlugin):
             self._kind_override = only_kind or ""
             try:
                 if client is None or store is None:
-                    return "插件还没准备好，稍后再试"
+                    return _RoundSummary("插件还没准备好，稍后再试", error=True)
                 if only_forums:
                     forums = [
                         str(name).strip() for name in only_forums if str(name or "").strip()
@@ -1129,7 +1147,7 @@ class StonePlugin(MaiBotPlugin):
                 else:
                     forums = resolve_forums(cfg.stone)
                 if not forums:
-                    return "配置里没勾也没填要逛的吧"
+                    return _RoundSummary("配置里没勾也没填要逛的吧", error=True)
                 per_forum = int(count) if int(count) > 0 else int(cfg.stone.count_per_forum)
                 return await self._run_locked(
                     cfg, client, store, forums, per_forum, streams, trigger, post_at
@@ -1215,6 +1233,9 @@ class StonePlugin(MaiBotPlugin):
         delivered = 0
         failed = 0
         host_error = ""
+        # 真正收到帖子的会话。结束语只往这些会话补 —— 一句都没发出去的群
+        # 再来一句「这是我今天发现的帖子」只会让人莫名其妙。
+        ok_streams: list[str] = []
         if collected:
             if streams is not None:
                 targets = streams
@@ -1234,6 +1255,9 @@ class StonePlugin(MaiBotPlugin):
                 delivered += 1
                 for thread, _detail in outcome:
                     skipped_tids.add(thread.tid)
+                if len(outcome) < len(collected):
+                    # 这个群至少收到了一条，结束语才有着落
+                    ok_streams.append(stream_id)
             # 只有「每个目标都收到了」才记「搬过了」。
             # 去重是帖子级的，任何一个群漏收都意味着它再也等不到这条 ——
             # 哪怕是永久丢帖。所以只要有一个目标失败就整条不记账，
@@ -1248,8 +1272,10 @@ class StonePlugin(MaiBotPlugin):
                     store.mark(forum_of.get(thread.tid, ""), thread.tid, thread.title)
         store.flush()
 
+        is_error = False
         if blocked:
             summary = "被贴吧拦住了，本轮先停下：%s" % blocked
+            is_error = True
         elif not collected:
             summary = "本轮没有新帖可搬（要么都搬过了，要么没够门槛）"
         else:
@@ -1263,13 +1289,37 @@ class StonePlugin(MaiBotPlugin):
             if failed:
                 # 有群没收到就不记账，下一轮会重搬；说清楚免得用户以为是重复发
                 summary += "，%d 个群没发成功（这几条下一轮会重搬一次）" % failed
+                is_error = True
             elif not delivered:
                 if host_error:
                     summary += "，但没问到会话列表（主程序可能正忙，过会儿再试）"
+                    is_error = True
                 elif streams is None:
                     summary += "，但没有找到可发的群（检查群配置或机器人是否在群里说过话）"
+                    is_error = True
+        # 结束语：这一轮真把帖子发进过某个群，才补这一句。
+        await self._say_closing(cfg, ok_streams)
         self.ctx.logger.info("[搬石] %s结束：%s", trigger, summary)
-        return summary
+        return _RoundSummary(summary, error=is_error)
+
+    async def _say_closing(self, cfg: Any, streams: Sequence[str]) -> None:
+        """一轮结束后，在收到帖子的会话里补一句话（面板上的「结束语」）。
+
+        留空则什么都不说。发送走闸门 —— 刚发完长图和视频，紧接着再说话最容易
+        撞上频控。
+        """
+        if not streams:
+            return
+        line = str(getattr(cfg.send, "closing_text", "") or "").strip()
+        if not line:
+            return
+        for stream_id in streams:
+            try:
+                await self._gate_of().run(
+                    self.ctx.send.text, line, stream_id, storage_message=False
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.ctx.logger.warning("[搬石] 结束语发不出去：%s", exc)
 
     async def _hold_until(self, post_at: datetime | None) -> None:
         """等到该发的那一刻再发。
@@ -2425,7 +2475,11 @@ class StonePlugin(MaiBotPlugin):
                 trigger="工具",
             )
         )
-        return {"success": True, "content": "好，开始搬石了，搬完直接发到这个会话里。"}
+        # 不在会话里播报「开始搬了」：成功是常态，只有出错才需要说话。
+        return {
+            "success": True,
+            "content": "已开始搬运，帖子与结束语由插件直接发送；成功时不再另行通知，只有出错才会说明。",
+        }
 
     # -- 命令 -------------------------------------------------------------
 
@@ -2530,12 +2584,12 @@ class StonePlugin(MaiBotPlugin):
             if not can_move:
                 await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
-            return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO, what="搬视频")
+            return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO)
         if low in ("图文", "搬图文", "图"):
             if not is_admin:
                 await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
-            return await self._cmd_move(stream_id, only_kind=_FILTER_TEXT, what="搬图文")
+            return await self._cmd_move(stream_id, only_kind=_FILTER_TEXT)
         await self.ctx.send.text(
             "不认识的子命令，打「/搬石 帮助」看看。", stream_id, storage_message=False
         )
@@ -2572,7 +2626,7 @@ class StonePlugin(MaiBotPlugin):
         if not can_move:
             await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
             return True, "维护命令需要管理员权限", 1
-        return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO, what="搬视频")
+        return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO)
 
     def _command_guard(self, kwargs: dict[str, Any], command: str) -> tuple[bool, str, int] | None:
         """命令入口的两道公共守卫：引用不算数、同一条消息只处理一次。
@@ -2593,16 +2647,17 @@ class StonePlugin(MaiBotPlugin):
             self._seen_message_ids.append(message_id)
         return None
 
-    async def _cmd_move(
-        self, stream_id: str, *, only_kind: str = "", what: str = "搬石"
-    ) -> tuple[bool, str, int]:
-        """立刻回一句「开始搬了」，真正那一轮丢后台跑。
+    async def _cmd_move(self, stream_id: str, *, only_kind: str = "") -> tuple[bool, str, int]:
+        """把这一轮丢到后台跑，自己立刻返回。
 
         宿主给命令 60 秒，而一轮搬石常常超过它。同步等的话宿主会判超时并把结果
-        丢掉，可插件这边还在跑 —— 用户既看不到回执，搬运又照常发生。所以命令
-        本身只负责应答，搬运交给后台任务，跑完再往群里发结果。
+        丢掉，可插件这边还在跑 —— 搬运照常发生，用户却什么也看不到。所以命令
+        本身只负责应答，搬运交给后台任务。
 
-        only_kind 非空时只搬那一种帖子（「/搬视频」用），what 只影响回执里那句话。
+        **成功时不说话**：帖子（和配置里的结束语）由后台任务直接发进群，再补一
+        句「开始搬了」「搬了 N 条」都是刷屏。只有出错时后台任务才会发一条说明。
+
+        only_kind 非空时只搬那一种帖子（「/搬视频」用）。
         """
         if self._busy or self._lock.locked():
             await self.ctx.send.text(
@@ -2611,9 +2666,6 @@ class StonePlugin(MaiBotPlugin):
             return True, "上一轮还没跑完", 1
         self._busy = True
         self._spawn_job(self._manual_round(stream_id, only_kind=only_kind))
-        await self.ctx.send.text(
-            "好，开始%s了，跑完把结果发这里。" % what, stream_id, storage_message=False
-        )
         return True, "已开始搬运", 1
 
     async def _manual_round(
@@ -2625,9 +2677,13 @@ class StonePlugin(MaiBotPlugin):
         only_kind: str = "",
         trigger: str = "手动",
     ) -> None:
-        """后台跑的那一轮：结果或错误都往群里发一条。
+        """后台跑的那一轮：**只有出错**才往群里发一句说明。
 
         命令入口只传 stream_id；模型工具入口还会带上吧名、条数和只要哪种帖。
+
+        成功时不吭声：帖子和结束语已经由 ``_run_locked`` 直接发进群了，再补一句
+        「本轮搬了 N 条」除了刷屏没有任何信息量。出错则必须说 —— 否则用户只看到
+        「这轮什么都没发生」，还以为是没够门槛。
         """
         try:
             summary = await self._run_round(
@@ -2641,7 +2697,12 @@ class StonePlugin(MaiBotPlugin):
             raise
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[搬石] 手动轮次异常：%s", exc, exc_info=True)
-            summary = "这轮搬石出错了：%s（详细原因看主程序日志）" % exc
+            summary = _RoundSummary(
+                "这轮搬石出错了：%s（详细原因看主程序日志）" % exc, error=True
+            )
+        if not getattr(summary, "error", False):
+            self.ctx.logger.info("[搬石] 手动一轮结束：%s", summary)
+            return
         try:
             await self.ctx.send.text(summary, stream_id, storage_message=False)
         except Exception as exc:  # noqa: BLE001

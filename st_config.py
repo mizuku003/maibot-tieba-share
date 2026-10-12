@@ -46,7 +46,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.0.6",
+        default="1.0.7",
         description="配置版本号，请勿手动修改",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
@@ -335,6 +335,14 @@ class SendSection(PluginConfigBase):
         le=1200,
         description="长图宽度（像素）",
         json_schema_extra={"label": "长图宽度", "hint": "只对「自绘卡片」有效"},
+    )
+    closing_text: str = Field(
+        default="主……主人，这……这是我今天发……发……发现的…有趣贴子♥别……别打我喵呜~",
+        description="一轮搬运结束后补的一句话",
+        json_schema_extra={
+            "label": "结束语",
+            "hint": "帖子发完后由麦麦在同一个群里补一句；留空则不说",
+        },
     )
 
 

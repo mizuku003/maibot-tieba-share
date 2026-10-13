@@ -171,11 +171,13 @@
 ## 数据来源
 
 - 帖子列表与正文：贴吧移动站（`tieba.baidu.com/mo/q/m`），免登录，仅使用访客 cookie。
-- 图片：帖内插图优先取原图，取不到时回退为带签名的缩略图。
+- 图片：只从贴吧自己的图库域名取（`imgsrc.baidu.com` 取原图，`tiebapic.baidu.com` 取带签名缩略图）；正文里出现的外链图床一律不请求。
 
 ## 依赖
 
-- `httpx`（已在 `_manifest.json` 里声明，由宿主自动安装）
+- `httpx`（已在 `_manifest.json` 里声明，由宿主自动安装）；长图渲染用宿主自带的渲染能力，不需要额外依赖。
+
+渲染走的是 SDK 的裸调用通道。包装层 `ctx.render.html2png` 不接受 RPC 超时参数，RPC 层固定按 30 秒算（`runner/rpc_client.py`），而贴吧原页面冷启动渲染常要 20 秒以上，所以插件直接调 `cap.call`（在 SDK 的 `_ALLOWED_RAW_HOST_METHODS` 里）把超时传下去，并用 `_normalize_capability_result` 归一化结果。这两项属于 SDK 内部接口，当前在 SDK 2.x 上验证可用；插件对它们做了能力探测，缺失时退回公开的 `ctx.render.html2png` —— 那条路 RPC 超时写死 30 秒，长页面可能渲不出来，但功能不会整体失效。
 
 ## 许可证
 

@@ -8,8 +8,9 @@
    cookie 再回来就正常了 —— 所以插件不需要任何人提供账号或票据。
 2. **被拦就停**。触发「百度安全验证」时立刻结束本轮并冷却 15 分钟，而不是换个姿势继续
    敲门；已经搬过的记录保留，下一轮接着来。
-3. **两种呈现各自独立**：文本 + 图片（一层层发）、一张长图（整帖渲染）。两个开关都开
-   就都发；长图渲染失败会自动退回文本，不让用户什么都收不到。
+3. **整帖渲染成长图**：每帖渲成一张长图（过长就切成几张），也可以打包成一条聊天记录。
+   长图渲不出来就跳过这帖 —— 既不补纯文字提要，也不退回逐层发图文，那两种兜底在群里
+   都是刷屏、内容还不完整；这帖不记成「已搬过」，下一轮会重来。
 4. **去重靠本地记录**（插件 data 目录里的 JSON），不动宿主的数据库 ——
    记录丢了最多重搬一次，不会影响机器人本身。
 """
@@ -32,7 +33,10 @@ from pathlib import Path
 from typing import Any, Sequence
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
-# 插件目录名带连字符，不能当包导入：把自身目录塞进 sys.path 再导同级模块。
+# 宿主是按文件路径加载 plugin.py 的，插件目录名（mizuku003-tieba-share）带连字符，
+# 本来就不是一个包，所以 `from . import st_client` 这种相对导入根本用不了；
+# st_client / st_fetch 这些同级模块之间也互相导入，同样依赖这一条。
+# 代价是往解释器的 sys.path 里插了一项进程级全局状态 —— 模块名都带 st_ 前缀，撞名概率极低。
 if str(_PLUGIN_DIR) not in _sys.path:
     _sys.path.insert(0, str(_PLUGIN_DIR))
 
@@ -213,7 +217,7 @@ _PAGE_IMAGE_LIMIT = 80
 # 单张长图也走 RPC，而图片在帧里要 base64 两份（见 _FORWARD_FRAME_BUDGET_BYTES 的
 # 说明），所以一张长图的**原文件**上限是 6.000 MiB。渲染出来的 PNG 是纯色块居多的
 # 截图，很容易就 8~12MB —— 超了这张图压根发不出去，而且是抛异常、用户什么都看不到。
-# 所以渲染完先按体积试，太大就降低设备缩放重渲几档，再不行才认输退回文本。
+# 所以渲染完先按体积试，太大就降低设备缩放重渲几档；几档都还是太大就放弃这张。
 _PAGE_IMAGE_SOFT_LIMIT_BYTES = 6 * 1024 * 1024
 # 重渲时依次尝试的设备缩放（越小越省体积，但字也越糊）。
 _PAGE_RENDER_SCALES = (2.0, 1.5, 1.25, 1.0)
@@ -1985,8 +1989,8 @@ class StonePlugin(MaiBotPlugin):
 
     async def _card_images(
         self, thread: Any, detail: Any, payload: dict[str, Any]
-    ) -> tuple[list[str], list[str], str]:
-        """把一条帖子渲染成长图；返回 (base64 列表, 落盘路径列表, 渲染不出来时的退回文本)。
+    ) -> tuple[list[str], list[str]]:
+        """把一条帖子渲染成长图；返回 (base64 列表, 落盘路径列表)。
 
         两个列表一一对应：``paths[i]`` 是 ``images[i]`` 落盘后的 ``file://`` 路径，
         落盘失败时对应项是空串。转发节点优先用路径（帧里只有两百来字节、与图片
@@ -2003,11 +2007,11 @@ class StonePlugin(MaiBotPlugin):
                 )
                 image_b64 = await self._render_page(html)
                 if image_b64:
-                    return [image_b64], [self._save_page_image(image_b64)], ""
+                    return [image_b64], [self._save_page_image(image_b64)]
                 # 渲染失败**不补文字**：那种"提要"在群里就是刷屏，而且它既不完整
                 # 也不好看。这帖当没搬过，交回去下轮重试（渲染器多半只是临时抽风）。
                 self.ctx.logger.warning("[搬石] 原页面长图渲染失败，这帖跳过")
-                return [], [], ""
+                return [], []
             self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
         uris: dict[str, str] = payload.get("uris") or {}
         sizes: dict[str, tuple[int, int]] = payload.get("sizes") or {}
@@ -2016,7 +2020,7 @@ class StonePlugin(MaiBotPlugin):
         floor_images = _select_floor_images(floors, uris, int(cfg.max_images))
         chunks = _plan_card_chunks(floors, sizes, width, floor_images)
         if not chunks:
-            return [], [], ""
+            return [], []
         images: list[str] = []
         paths: list[str] = []
         for index, chunk in enumerate(chunks):
@@ -2031,7 +2035,7 @@ class StonePlugin(MaiBotPlugin):
                 parts=len(chunks),
             )
             # 同样盯着体积：自绘卡片比原页面短，但长帖切出来的分片一样可能超标，
-            # 超了这张就发不出去。降档重渲，还不行才退回文本。
+            # 超了这张就发不出去。降档重渲，几档都还不行就放弃这帖。
             image_b64 = ""
             for scale in _PAGE_RENDER_SCALES:
                 try:
@@ -2058,10 +2062,10 @@ class StonePlugin(MaiBotPlugin):
             if not image_b64:
                 # 见上：渲不出来就跳过这帖，不补任何文字。
                 self.ctx.logger.warning("[搬石] 长图渲染失败或太大，这帖跳过")
-                return [], [], ""
+                return [], []
             images.append(image_b64)
             paths.append(self._save_page_image(image_b64))
-        return images, paths, ""
+        return images, paths
 
     async def _render_page(self, html: str) -> str:
         """把整页 HTML 交给宿主渲染器截成一张长图；失败返回空串。
@@ -2072,13 +2076,14 @@ class StonePlugin(MaiBotPlugin):
         原文件上限只有 6.000 MiB；贴吧原页面又长又花，2 倍缩放出来的 PNG 轻易就 8~12MB。
         超限的话 ``ctx.send.image`` 会抛异常，用户那边一张图都看不到，而插件只是记一行
         日志 —— 等于白搬。所以大了就降档重渲（缩放越小体积越小，代价是字更糊），
-        几档都还不行才认输退回文本。
+        几档都还不行就放弃这张长图。
 
         另外**不能走 ``ctx.render.html2png``**。SDK 那个包装不收 ``timeout_ms``，RPC 侧
         一律按默认的 30 秒算（``runner/rpc_client.py``），而 ``render_timeout_ms`` 只传给
         宿主渲染器、管不了 RPC。贴吧原页面冷启动渲染本来就常要 20 秒以上，一超 30 秒
         这边就先抛 ``[E_TIMEOUT] cap.call 超时`` 放弃了，宿主其实还在渲 —— 白等一场，
-        退回去发文本。所以这里直接用 ``call_host_method`` 把 RPC 超时也按渲染超时给足。
+        白等一场。所以这里直接用 ``call_host_method`` 把 RPC 超时也按渲染超时给足（这个
+        私有通道不可用时退回 ``ctx.render.html2png``，见 :meth:`_call_render_capability`）。
         """
         for scale in _PAGE_RENDER_SCALES:
             try:
@@ -2101,14 +2106,41 @@ class StonePlugin(MaiBotPlugin):
                 _PAGE_IMAGE_SOFT_LIMIT_BYTES / 1048576.0,
                 scale,
             )
-        self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这条退回文本")
+        self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这帖跳过")
         return ""
+
+    async def _call_render_capability(self, payload: dict[str, Any], timeout_ms: int) -> Any:
+        """把一次渲染请求交给宿主，返回归一化后的结果。
+
+        正常走 ``cap.call`` 裸调用。SDK 的 ``ctx.render.html2png`` 是薄包装，不收
+        ``timeout_ms``，RPC 层一律按默认的 30 秒算（``runner/rpc_client.py``），而贴吧
+        原页面冷启动渲染本来就常要 20 秒以上 —— 一超时就是这边先放弃、宿主其实还在渲，
+        白等一场。``cap.call`` 在 SDK 的 ``_ALLOWED_RAW_HOST_METHODS`` 里，是它
+        明确放行的裸调用。
+
+        但 ``_normalize_capability_result`` 带下划线，属于 SDK 内部接口，升级时可能改名
+        或消失。所以这里先做能力探测：两个都在才走上面那条路，否则退回公开的
+        ``ctx.render.html2png`` —— 那条路的 RPC 超时写死 30 秒，长页面可能渲不出来，
+        但插件不会因为 SDK 换了个内部方法名就整条渲染链路失效。
+        """
+        raw_call = getattr(self.ctx, "call_host_method", None)
+        normalize = getattr(self.ctx, "_normalize_capability_result", None)
+        if callable(raw_call) and callable(normalize):
+            result = await raw_call("cap.call", payload=payload, timeout_ms=timeout_ms)
+            return normalize("render.html2png", result)
+        fallback = getattr(getattr(self.ctx, "render", None), "html2png", None)
+        if not callable(fallback):
+            self.ctx.logger.warning("[搬石] 当前 SDK 既没有 cap.call 通道也没有渲染能力，长图渲不出来")
+            return None
+        self.ctx.logger.debug("[搬石] 退回落 ctx.render.html2png（RPC 超时固定 30 秒）")
+        return await fallback(**dict(payload.get("args") or {}))
 
     async def _render_card_html(self, html: str, scale: float) -> Any:
         """渲染自绘卡片（选择器 ``#card``）。
 
         和 :meth:`_render_html2png` 同样要绕开 SDK 包装的 30 秒默认超时 ——
-        长帖切出来的分片一样能渲染很久。
+        长帖切出来的分片一样能渲染很久。两条路都收在
+        :meth:`_call_render_capability` 里。
         """
         payload = {
             "capability": "render.html2png",
@@ -2126,10 +2158,9 @@ class StonePlugin(MaiBotPlugin):
                 "allow_network": False,
             },
         }
-        result = await self.ctx.call_host_method(
-            "cap.call", payload=payload, timeout_ms=_CARD_RENDER_TIMEOUT_MS + _RENDER_RPC_SLACK_MS
+        return await self._call_render_capability(
+            payload, _CARD_RENDER_TIMEOUT_MS + _RENDER_RPC_SLACK_MS
         )
-        return self.ctx._normalize_capability_result("render.html2png", result)
 
     async def _render_html2png(self, html: str, scale: float, timeout_ms: int) -> Any:
         """渲染 HTML，并且让 RPC 超时跟着渲染超时走（默认 30 秒根本不够）。
@@ -2159,10 +2190,7 @@ class StonePlugin(MaiBotPlugin):
         }
         # 插件自己再多等一会儿：宿主判超时会先返回错误，这里只是兜住 RPC 层，
         # 免得它比宿主更早放弃、把一个还在渲的页面扔掉。
-        result = await self.ctx.call_host_method(
-            "cap.call", payload=payload, timeout_ms=timeout_ms + _RENDER_RPC_SLACK_MS
-        )
-        return self.ctx._normalize_capability_result("render.html2png", result)
+        return await self._call_render_capability(payload, timeout_ms + _RENDER_RPC_SLACK_MS)
 
     async def _send_cards(
         self, stream_id: str, thread: Any, detail: Any, payload: dict[str, Any]
@@ -2173,7 +2201,7 @@ class StonePlugin(MaiBotPlugin):
         两种兜底在群里都是刷屏，内容还不完整。调用方拿到 False 就别把这帖
         记成「已搬过」，下一轮它会重来（渲染失败多半只是临时抽风）。
         """
-        images, paths, _fallback = await self._card_images(thread, detail, payload)
+        images, paths = await self._card_images(thread, detail, payload)
         if not images:
             return False
         for index, image_b64 in enumerate(images):
@@ -2249,7 +2277,7 @@ class StonePlugin(MaiBotPlugin):
             )
             header_cost = len(str(header.get("data") or "")) + _FORWARD_NODE_OVERHEAD
             used_bytes += header_cost
-            images, paths, _fallback = await self._card_images(thread, detail, payload)
+            images, paths = await self._card_images(thread, detail, payload)
             if not images:
                 # 长图渲不出来。不能把标题节点孤零零留在聊天记录里 ——
                 # 那就是一条只有标题、没有正文的刷屏节点。整帖退出这条

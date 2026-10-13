@@ -44,7 +44,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
@@ -310,20 +310,54 @@ def _is_ui_image(url: str) -> bool:
     return "/tb/editor/images/" in low
 
 
+# 只从贴吧自己的图库域名上取图（含子域）。这里用后缀比对，不用 `"baidu.com" in url`：
+# 子串比对会让 baidu.com.evil.com 这类域名蒙混过关。正文里的外链图一律不取 ——
+# 那等于让远端页面决定插件去请求哪个地址，还能顺手指向 localhost、内网和云元数据。
+IMAGE_HOST_SUFFIXES = ("baidu.com", "bdstatic.com", "bdimg.com", "bcebos.com")
+
+
+def _host_of(url: str) -> str:
+    """取 URL 的 host（小写、不含端口）；取不到返回空串。"""
+    raw = (url or "").strip()
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme not in ("http", "https"):
+        return ""
+    return (parsed.hostname or "").strip().lower()
+
+
+def _host_ok(url: str, suffixes: tuple[str, ...]) -> bool:
+    """URL 的域名是不是给定后缀之一（后缀本身，或它的子域）。"""
+    host = _host_of(url)
+    if not host:
+        return False
+    return any(host == suffix or host.endswith("." + suffix) for suffix in suffixes)
+
+
+def _image_host_ok(url: str) -> bool:
+    """URL 是不是贴吧图库域名上的。"""
+    return _host_ok(url, IMAGE_HOST_SUFFIXES)
+
+
 def _looks_like_image(url: str) -> bool:
     """data-url 里的值是不是真的用户图片。
 
     容器标签（pb_imgs、pb_imgs_div）本来就不带 data-url，这里再挡一道，
     免得以后贴吧给别的元素也加上 data-url 时被误当成图片。
+
+    域名必须落在 IMAGE_HOST_SUFFIXES 里：贴吧正文图只有两个来源（imgsrc 原图直链、
+    tiebapic 带签名缩略图），页面里别处出现的地址（包括吧友贴的外链图床）一概不取。
     """
     low = (url or "").strip().lower()
     if not low.startswith(("http://", "https://", "//")):
         return False
     if _is_ui_image(low):
         return False
-    if any(host in low for host in (THUMB_IMAGE_HOST, ORIGIN_IMAGE_HOST, "baidu.com")):
-        return True
-    return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp)(?:\?|&|$)", low))
+    return _image_host_ok(low)
 
 
 def _int_or_none(raw: Any) -> int | None:
@@ -429,7 +463,7 @@ def images_of(segment: str) -> tuple[list[str], list[str]]:
         u = _html.unescape(src_m.group("u"))
         if u.startswith("//"):
             u = "https:" + u
-        if _is_ui_image(u):
+        if _is_ui_image(u) or not _image_host_ok(u):
             continue
         origin.append(to_origin_image(u))
         thumbs.append(u)
@@ -484,7 +518,7 @@ def videos_of(segment: str) -> list[StoneVideo]:
             url = "https:" + url
         if not url.lower().startswith("http"):
             continue
-        if not any(host in url for host in VIDEO_HOSTS):
+        if not _host_ok(url, VIDEO_HOSTS):
             continue
         out.append(StoneVideo(url=url))
     # 封面按「DOM 顺序」配对：一路扫过去，遇到视频转码地址就起一个新视频，
@@ -1195,6 +1229,11 @@ class StoneTiebaClient:
         # 的第二步，再歇一遍等于每张图花两个 delay，三十张图的帖子白等一分半。
         await self._sleep()
         for cand in candidates:
+            # 候选地址是从页面里解析出来的，落盘前再验一道域名：真正的请求出口只认
+            # 贴吧图库，免得页面内容把插件指到内网地址或者别的图床上去。
+            if not _image_host_ok(cand):
+                logger.debug("[搬石/贴吧] 图片域名不在白名单，跳过：%s", cand)
+                continue
             try:
                 resp = await self._client.get(cand, headers=headers)
             except Exception as exc:  # noqa: BLE001

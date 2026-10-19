@@ -43,6 +43,20 @@ if str(_PLUGIN_DIR) not in _sys.path:
 _DEFAULT_FORWARD_NAME = "？！石！？"
 
 
+_TIMEOUT_HINTS = ("timeout", "timed out", "超时", "e_timeout")
+
+
+def _looks_like_timeout(text: str) -> bool:
+    """判断一条渲染失败信息是不是「等超时了」。
+
+    超时和别的失败要分开对待：超时说明这页在给定的耐心内就是没 load 完，换一档
+    缩放重来（页面要加载的外链一张不少）或者原样重试，都只是把同样的等待再来一遍；
+    而浏览器刚崩、RPC 抖一下这类瞬时故障，隔几秒重试一次往往就过了。
+    """
+    low = str(text or "").lower()
+    return any(hint in low for hint in _TIMEOUT_HINTS)
+
+
 def _file_uri(path: Path) -> str:
     """把本地路径转成 ``file:///`` URI。
 
@@ -209,14 +223,14 @@ _CARD_STYLE_PAGE = "贴吧原页面"
 # 补进页面的图按卡片宽留 820 像素就够清楚（页面里文字区就这么宽）
 _PAGE_VIEWPORT_WIDTH = 414
 _PAGE_VIEWPORT_HEIGHT = 900
-# 60 秒。实测一台内存宽裕的机器渲染一页贴吧长图只要 2~5 秒，看起来余量大得离谱，
-# 但这 11 倍余量是留给「慢网」的：原页面模式的 wait_until 是 load，一个 30 楼的帖
-# 有七十多张外链图要走贴吧 CDN，网速一差就得等。宁可偶尔白等一分钟，也不能把本来
-# 能渲出来的帖子判死 —— 判死就等于整帖不发。
+# 60 秒。原页面模式的 wait_until 是 load，一个 30 楼的帖有七十多张外链图要走贴吧 CDN，
+# 网速一差就得等；实测正常一页只要 1~4 秒，所以这个值平时根本用不到，只在慢网时救命。
 #
-# 曾经试过收到 25 秒，想靠「早放弃早换下一帖」去躲内存吃紧的机器，那个思路是错的：
-# 内存被内核节流时渲染进程是被按住的，等 25 秒和等 60 秒一样出不来，而网络慢时
-# 25 秒却是实打实的不够。缩短超时既救不了卡死的机器，还会误伤正常的机器。
+# 它一度被收到 25 秒，起因是当时云端宿主有 bug（Playwright 1.58 上 page.route 的
+# functools.partial handler 根本不进），每一档都必然等满超时，看起来就像「渲染就是慢」。
+# 那个 bug 已在宿主侧靠升级 Playwright 修掉，一页现在 3~4 秒出图。既然正常路径用不到
+# 这 60 秒，就没有理由为了「失败时少白等」去砍它 —— 砍了只会在慢网时误杀本来能出的图，
+# 而误杀的代价是整帖不发。
 # 真要减少白等，靠的是下面少留几档缩放（档数就是白等倍率），不是砍超时。
 _PAGE_RENDER_TIMEOUT_MS = 60000
 _PAGE_IMAGE_MAX_WIDTH = 820
@@ -239,6 +253,12 @@ _RENDER_RPC_SLACK_MS = 15_000
 # 自绘卡片是本地 HTML（图都内嵌成 data:，不联网），正常一两秒就出来。
 # 同样给足余量：机器忙的时候多等几十秒，好过把一条本来能发的帖子判死。
 _CARD_RENDER_TIMEOUT_MS = 45_000
+# 渲染失败后在同一档重试的次数。只对「瞬时故障」生效（浏览器刚崩、RPC 抖了一下），
+# 超时不重试 —— 超时说明这一页在外网那头就是等不到 load，原样再来一遍只会白等
+# 第二个 60 秒，而慢网恰恰是常态（云端出网只有 3Mbps），等不到就是等不到。
+_RENDER_TRANSIENT_RETRY = 1
+# 重试前歇一下，给宿主那边重启浏览器的工夫（它的失败路径会 reset 掉实例）。
+_RENDER_RETRY_PAUSE_S = 3.0
 
 # 长图落盘目录（插件 data 目录下的 pages/）。
 #
@@ -2123,35 +2143,57 @@ class StonePlugin(MaiBotPlugin):
             )
             # 同样盯着体积：自绘卡片比原页面短，但长帖切出来的分片一样可能超标，
             # 超了这张就发不出去。降档重渲，几档都还不行就放弃这帖。
+            # 但**只有「渲出来了但太大」才降档**：渲染本身失败（超时/浏览器崩）时
+            # 降档救不了它，再试一遍只是把白等翻倍（同 :meth:`_render_page`）。
+            # 同一档上给瞬时故障留一次重试，超时不重试 —— 理由见 :meth:`_render_page`。
             image_b64 = ""
             card_reason = ""
             for scale in _PAGE_RENDER_SCALES:
-                try:
-                    result = await self._render_card_html(html, scale)
-                except Exception as exc:  # noqa: BLE001
-                    card_reason = "%s: %s" % (type(exc).__name__, exc)
-                    self.ctx.logger.warning(
-                        "[搬石] 长图渲染抛异常（缩放 %s）：%s", scale, exc
-                    )
-                    result = None
-                candidate = ""
-                if isinstance(result, dict):
-                    candidate = str(result.get("image_base64") or "")
-                if not candidate:
-                    if isinstance(result, dict) and not card_reason:
-                        card_reason = str(
-                            result.get("error") or result.get("message") or result
-                        )[:200]
-                    continue
-                raw_bytes = len(candidate) * 3 // 4
-                if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
+                for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
+                    try:
+                        result = await self._render_card_html(html, scale)
+                    except Exception as exc:  # noqa: BLE001
+                        card_reason = "%s: %s" % (type(exc).__name__, exc)
+                        self.ctx.logger.warning(
+                            "[搬石] 长图渲染抛异常（缩放 %s，第 %d 次）：%s",
+                            scale,
+                            attempt + 1,
+                            exc,
+                        )
+                        if (
+                            _looks_like_timeout(card_reason)
+                            or attempt >= _RENDER_TRANSIENT_RETRY
+                        ):
+                            break
+                        await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+                        continue
+                    candidate = ""
+                    if isinstance(result, dict):
+                        candidate = str(result.get("image_base64") or "")
+                    if not candidate:
+                        if isinstance(result, dict) and not card_reason:
+                            card_reason = str(
+                                result.get("error") or result.get("message") or result
+                            )[:200]
+                        if _looks_like_timeout(card_reason) or attempt >= (
+                            _RENDER_TRANSIENT_RETRY
+                        ):
+                            break
+                        await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+                        continue
                     image_b64 = candidate
+                    break
+                if not image_b64:
+                    break
+                raw_bytes = len(image_b64) * 3 // 4
+                if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
                     break
                 self.ctx.logger.warning(
                     "[搬石] 卡片长图 %.1f MB 超过单张上限，降档重渲：%sx",
                     raw_bytes / 1048576.0,
                     scale,
                 )
+                image_b64 = ""
             if not image_b64:
                 # 见上：渲不出来就跳过这帖，不补任何文字。
                 self.ctx.logger.warning(
@@ -2174,34 +2216,53 @@ class StonePlugin(MaiBotPlugin):
         日志 —— 等于白搬。所以大了就降档重渲（缩放越小体积越小，代价是字更糊），
         几档都还不行就放弃这张长图。
 
+        **只有「渲出来了但太大」才降档重试**。渲染本身失败（超时、浏览器崩、参数被拒）
+        时降档救不了它 —— 缩放只影响出图体积，不影响页面能不能 load 完，同样的等待
+        再来一遍只是把白等翻倍。这条区别以前没分清，一个必然超时的帖会老老实实把两档
+        都等满，一轮四帖就是八次满额超时，用户看到的就是「搬了十分钟还在搬」。
+
+        但「渲染失败」里还得分两类，不能一律放弃：**超时**是真的等不到，原样重来只是
+        再白等一个超时（云端出网才 3Mbps，慢网是常态，等不到就是等不到）；而浏览器刚
+        崩、RPC 抖一下这类**瞬时故障**，宿主会在失败路径里 reset 掉浏览器实例，隔几秒
+        重试一次往往就能过。所以同一档上给瞬时故障一次重试机会，超时不重试。
+
         另外**不能走 ``ctx.render.html2png``**。SDK 那个包装不收 ``timeout_ms``，RPC 侧
         一律按默认的 30 秒算（``runner/rpc_client.py``），而 ``render_timeout_ms`` 只传给
-        宿主渲染器、管不了 RPC。贴吧原页面冷启动渲染本来就常要 20 秒以上，一超 30 秒
-        这边就先抛 ``[E_TIMEOUT] cap.call 超时`` 放弃了，宿主其实还在渲 —— 白等一场，
-        白等一场。所以这里直接用 ``call_host_method`` 把 RPC 超时也按渲染超时给足（这个
-        私有通道不可用时退回 ``ctx.render.html2png``，见 :meth:`_call_render_capability`）。
+        宿主渲染器、管不了 RPC。插件给的单档耐心是 ``_PAGE_RENDER_TIMEOUT_MS`` 再加
+        ``_RENDER_RPC_SLACK_MS`` 的 RPC 余量，比 30 秒长；走包装就会在宿主还在渲的时候
+        这边先抛 ``[E_TIMEOUT] cap.call 超时`` 放弃 —— 白等一场。所以这里直接用
+        ``call_host_method`` 把 RPC 超时也按渲染超时给足（这个私有通道不可用时退回
+        ``ctx.render.html2png``，见 :meth:`_call_render_capability`）。
         """
-        failed = 0
         too_big = 0
         last_reason = ""
         for scale in _PAGE_RENDER_SCALES:
-            started = time.monotonic()
-            try:
-                result = await self._render_html2png(html, scale, _PAGE_RENDER_TIMEOUT_MS)
-            except Exception as exc:  # noqa: BLE001
-                failed += 1
-                last_reason = "%s: %s" % (type(exc).__name__, exc)
-                self.ctx.logger.warning("[搬石] 原页面渲染抛异常（缩放 %s）：%s", scale, exc)
-                continue
-            elapsed = time.monotonic() - started
             image_b64 = ""
-            if isinstance(result, dict):
-                image_b64 = str(result.get("image_base64") or "")
-            if not image_b64:
+            # 内层是「同一档重试」，只对瞬时故障生效；外层才是「降档」，只对体积超标生效。
+            for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
+                started = time.monotonic()
+                try:
+                    result = await self._render_html2png(html, scale, _PAGE_RENDER_TIMEOUT_MS)
+                except Exception as exc:  # noqa: BLE001
+                    last_reason = "%s: %s" % (type(exc).__name__, exc)
+                    self.ctx.logger.warning(
+                        "[搬石] 原页面渲染抛异常（缩放 %s，第 %d 次）：%s",
+                        scale,
+                        attempt + 1,
+                        exc,
+                    )
+                    if _looks_like_timeout(last_reason) or attempt >= _RENDER_TRANSIENT_RETRY:
+                        break
+                    await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+                    continue
+                elapsed = time.monotonic() - started
+                if isinstance(result, dict):
+                    image_b64 = str(result.get("image_base64") or "")
+                if image_b64:
+                    break
                 # 宿主没抛异常却没给图，说明它自己判失败了（超时/浏览器挂了/参数被拒）。
                 # 以前的实现直接 continue，日志里只留下一句「降档后仍然太大」—— 明明一张图
                 # 都没渲出来，却报「太大」，把排查方向带偏。这里把宿主的原话记下来。
-                failed += 1
                 detail = ""
                 if isinstance(result, dict):
                     detail = str(result.get("error") or result.get("message") or result)[:200]
@@ -2214,7 +2275,13 @@ class StonePlugin(MaiBotPlugin):
                     elapsed,
                     detail,
                 )
-                continue
+                if _looks_like_timeout(detail) or attempt >= _RENDER_TRANSIENT_RETRY:
+                    break
+                await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+            if not image_b64:
+                # 渲染本身失败：降档救不了它（缩放只影响出图体积，不影响页面能不能
+                # load 完），再赔一整个超时进去没有意义。这帖交回去下轮重试。
+                break
             # base64 长度反推原始字节：base64 是 4 个字符存 3 字节。
             raw_bytes = len(image_b64) * 3 // 4
             if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
@@ -2230,8 +2297,7 @@ class StonePlugin(MaiBotPlugin):
             self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这帖跳过")
         else:
             self.ctx.logger.warning(
-                "[搬石] 原页面长图没渲出来（%d 档全失败，最后一档：%s），这帖跳过",
-                failed,
+                "[搬石] 原页面长图没渲出来（%s），这帖跳过",
                 last_reason or "未知",
             )
         return ""
@@ -2240,10 +2306,9 @@ class StonePlugin(MaiBotPlugin):
         """把一次渲染请求交给宿主，返回归一化后的结果。
 
         正常走 ``cap.call`` 裸调用。SDK 的 ``ctx.render.html2png`` 是薄包装，不收
-        ``timeout_ms``，RPC 层一律按默认的 30 秒算（``runner/rpc_client.py``），而贴吧
-        原页面冷启动渲染本来就常要 20 秒以上 —— 一超时就是这边先放弃、宿主其实还在渲，
-        白等一场。``cap.call`` 在 SDK 的 ``_ALLOWED_RAW_HOST_METHODS`` 里，是它
-        明确放行的裸调用。
+        ``timeout_ms``，RPC 层一律按默认的 30 秒算（``runner/rpc_client.py``），而插件
+        给的单档耐心比 30 秒长 —— 一超时就是这边先放弃、宿主其实还在渲，白等一场。
+        ``cap.call`` 在 SDK 的 ``_ALLOWED_RAW_HOST_METHODS`` 里，是它明确放行的裸调用。
 
         但 ``_normalize_capability_result`` 带下划线，属于 SDK 内部接口，升级时可能改名
         或消失。所以这里先做能力探测：两个都在才走上面那条路，否则退回公开的

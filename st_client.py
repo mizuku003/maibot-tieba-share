@@ -341,32 +341,38 @@ def parse_frs_response(raw: bytes, *, forum: str = "") -> tuple[list[dict[str, A
         return [], "响应里没有 data"
     users = _user_map(data, FRS_USER_LIST)
     out: list[dict[str, Any]] = []
+    # 逐条 try：函数 docstring 承诺「不抛异常」，但下面每一项都要读十来个字段，
+    # 字段形状一变（比如某个 text 字段突然变成嵌套 message）就会在**中间**炸掉，
+    # 结果是这一页前面已经解析好的帖子也一起丢掉、整轮少发。单条坏了就跳过它。
     for th in data.messages(FRS_THREAD_LIST):
-        tid = str(th.uint(TH_ID) or "")
-        if not tid:
+        try:
+            tid = str(th.uint(TH_ID) or "")
+            if not tid:
+                continue
+            author_id = th.uint(TH_AUTHOR_ID)
+            name = _display_name(users.get(author_id, Message()))
+            if not name:
+                # 列表页的 thread_list 里也可能自带 author，兜底用一下
+                name = _display_name(th.message(TH_AUTHOR))
+            out.append(
+                {
+                    "tid": tid,
+                    "title": th.text(TH_TITLE),
+                    "forum": forum,
+                    "is_top": bool(th.uint(TH_IS_TOP)),
+                    "is_good": bool(th.uint(TH_IS_GOOD)),
+                    "replies": th.uint(TH_REPLY_NUM),
+                    "views": th.uint(TH_VIEW_NUM),
+                    "agree": _agree_num(th, TH_AGREE),
+                    "thread_type": th.uint(TH_THREAD_TYPE),
+                    "author_id": author_id,
+                    "author": name,
+                    "create_time": th.uint(TH_CREATE_TIME),
+                    "has_video": bool(th.has(TH_VIDEO_INFO)),
+                }
+            )
+        except Exception:  # noqa: BLE001
             continue
-        author_id = th.uint(TH_AUTHOR_ID)
-        name = _display_name(users.get(author_id, Message()))
-        if not name:
-            # 列表页的 thread_list 里也可能自带 author，兜底用一下
-            name = _display_name(th.message(TH_AUTHOR))
-        out.append(
-            {
-                "tid": tid,
-                "title": th.text(TH_TITLE),
-                "forum": forum,
-                "is_top": bool(th.uint(TH_IS_TOP)),
-                "is_good": bool(th.uint(TH_IS_GOOD)),
-                "replies": th.uint(TH_REPLY_NUM),
-                "views": th.uint(TH_VIEW_NUM),
-                "agree": _agree_num(th, TH_AGREE),
-                "thread_type": th.uint(TH_THREAD_TYPE),
-                "author_id": author_id,
-                "author": name,
-                "create_time": th.uint(TH_CREATE_TIME),
-                "has_video": bool(th.has(TH_VIDEO_INFO)),
-            }
-        )
     return out, ""
 
 
@@ -404,29 +410,35 @@ def parse_page_response(
         info["is_good"] = bool(thread.uint(TH_IS_GOOD))
         info["thread_type"] = thread.uint(TH_THREAD_TYPE)
     floors: list[dict[str, Any]] = []
+    # 同样逐条 try：一层楼坏了不该让整页楼层都没了。注意 idx 必须照样递增 ——
+    # 楼层号是 base + idx + 1 现编的，跳过一条后后面的号会整体前移，但这是
+    # 唯一可行的取舍（没有可信的真实楼层号），且跳过的那层本来就不显示。
     for idx, post in enumerate(data.messages(PAGE_POST_LIST)):
-        author_id = post.uint(POST_AUTHOR_ID)
-        user = users.get(author_id, Message())
-        name = _display_name(user)
-        # 楼层号自编：响应里的 floor 不可信（几乎全是 0），但第一条如果是 1
-        # 就说明服务端认得，用它的更保险 —— 自编只是为了填补剩下的。
-        seq = floor_number_base + idx + 1
-        real = post.uint(POST_FLOOR)
-        floors.append(
-            {
-                "fn": real or seq,
-                "pid": str(post.uint(POST_ID) or ""),
-                "author": name,
-                "author_id": author_id,
-                "level": user.uint(USER_LEVEL),
-                "portrait": user.text(USER_PORTRAIT),
-                "time": post.uint(POST_TIME),
-                "agree": _agree_num(post, POST_AGREE),
-                "content": post.messages(POST_CONTENT),
-                "comment_total": post.uint(POST_SUB_POST_NUMBER),
-                "comments": _parse_comments(post, users) if with_floor else [],
-            }
-        )
+        try:
+            author_id = post.uint(POST_AUTHOR_ID)
+            user = users.get(author_id, Message())
+            name = _display_name(user)
+            # 楼层号自编：响应里的 floor 不可信（几乎全是 0），但第一条如果是 1
+            # 就说明服务端认得，用它的更保险 —— 自编只是为了填补剩下的。
+            seq = floor_number_base + idx + 1
+            real = post.uint(POST_FLOOR)
+            floors.append(
+                {
+                    "fn": real or seq,
+                    "pid": str(post.uint(POST_ID) or ""),
+                    "author": name,
+                    "author_id": author_id,
+                    "level": user.uint(USER_LEVEL),
+                    "portrait": user.text(USER_PORTRAIT),
+                    "time": post.uint(POST_TIME),
+                    "agree": _agree_num(post, POST_AGREE),
+                    "content": post.messages(POST_CONTENT),
+                    "comment_total": post.uint(POST_SUB_POST_NUMBER),
+                    "comments": _parse_comments(post, users) if with_floor else [],
+                }
+            )
+        except Exception:  # noqa: BLE001
+            continue
     return floors, info, ""
 
 
@@ -464,21 +476,25 @@ def _parse_comments(post: Message, users: "dict[int, Message]") -> list[dict[str
     out: list[dict[str, Any]] = []
     for wrapper in post.messages(POST_SUB_POST_LIST):
         for sub in wrapper.messages(SUB_LIST):
-            text = comment_text(sub.raw(SUBL_SHELL))
-            if not text:
+            # 单条楼中楼坏了就跳过：它只是「评论区的补充」，不该连累整层楼。
+            try:
+                text = comment_text(sub.raw(SUBL_SHELL))
+                if not text:
+                    continue
+                author_id = sub.uint(SUBL_AUTHOR_ID)
+                user = users.get(author_id, Message())
+                out.append(
+                    {
+                        "pid": str(sub.uint(SUBL_ID) or ""),
+                        "author": _display_name(user),
+                        "author_id": author_id,
+                        "level": user.uint(USER_LEVEL),
+                        "time": sub.uint(SUBL_TIME),
+                        "text": text,
+                    }
+                )
+            except Exception:  # noqa: BLE001
                 continue
-            author_id = sub.uint(SUBL_AUTHOR_ID)
-            user = users.get(author_id, Message())
-            out.append(
-                {
-                    "pid": str(sub.uint(SUBL_ID) or ""),
-                    "author": _display_name(user),
-                    "author_id": author_id,
-                    "level": user.uint(USER_LEVEL),
-                    "time": sub.uint(SUBL_TIME),
-                    "text": text,
-                }
-            )
     return out
 
 
@@ -542,9 +558,40 @@ def content_images(parts: "list[Message]") -> "list[str]":
 def looks_like_proto(raw: bytes) -> bool:
     """粗判一段字节像不像 protobuf。
 
-    客户端接口返回的不是 protobuf 时，往往是 HTML 错误页（反爬拦截、接口改版）。
-    直接丢给 parse 会抛异常，而那种异常信息（「字段号 0」之类）看不出真实原因。
-    这里先认一下开头：HTML 一定以 ``<`` 开头，protobuf 的 tag 字节不会。
+    客户端接口返回的不是 protobuf 时，往往是 HTML 错误页（反爬拦截、接口改版），
+    也可能是一段 JSON、纯文本，或者干脆是空的。直接丢给 parse 会抛异常，而那种
+    异常信息（「字段号 0」之类）看不出真实原因。
+
+    判据（注意顺序，顺序错了会把合法 protobuf 判成文本）：
+
+    1. 空响应不算；去掉开头的 UTF-8 BOM。
+    2. 原始首字节是 ``<`` / ``{`` / ``[`` 的，是 HTML/XML/JSON，不算。
+    3. 跳过前导空白（错误页前面常有几个换行）后，如果变成了空、或者变成
+       上面那三种开头，也不算 —— 这一步只用来识别**文本**，不用来改判 protobuf。
+    4. 最后才看 tag 合法性：低 3 位必须是合法 wire type（0/1/2/5），
+       高 5 位字段号不能为 0。
+
+    **第 4 步必须用原始首字节，不能先 lstrip 再判**：``\x0a`` / ``\x0d`` /
+    ``\x09`` 既是换行/回车/TAB，也是 field 1 的 wire2/wire5/wire1 —— 而 field 1
+    恰恰是 protobuf 最常见的第一字段。先 lstrip 就会把这类响应的首字节吃掉，
+    再把后面的内容当成 tag，于是合法响应被判成「不像 protobuf」，整条 protobuf
+    路线被静默跳过（调用方会退回 HTML 路线，表面只是少了个点赞数）。
     """
-    head = (raw or b"")[:1]
-    return bool(head) and head != b"<"
+    head = raw or b""
+    if head.startswith(b"\xef\xbb\xbf"):
+        head = head[3:]
+    if not head:
+        return False
+    if head[0] in (0x3C, 0x7B, 0x5B):  # < { [
+        return False
+    # 只为识别「前面带空白的文本页」，不参与下面的 tag 判定
+    stripped = head.lstrip(b" \t\r\n")
+    if not stripped:
+        return False
+    if stripped[0] in (0x3C, 0x7B, 0x5B):
+        return False
+    first = head[0]
+    wire = first & 0x07
+    if wire not in (0, 1, 2, 5):
+        return False
+    return (first >> 3) != 0

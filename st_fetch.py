@@ -9,7 +9,8 @@
   **楼中楼正文**（HTML 只渲染前几条且没有点赞数，protobuf 能按 ``floor_rn`` 要更多）。
 
 两个接口都不需要登录，也不需要 BDUSS —— 实测无 cookie 直接 POST 就是 ``errno=0``。
-之所以还要播种访客 cookie，是为了让整条链路的出口 IP 指纹跟 HTML 抓取保持一致。
+（以前这里写过「还要播种访客 cookie 保持出口指纹一致」，但这一层其实从来没有
+播种过 cookie，那句话是错的：protobuf 接口按上面的实测根本不需要它。）
 """
 
 from __future__ import annotations
@@ -55,6 +56,11 @@ VIDEO_THREAD_TYPE = 40
 
 # protobuf 路线一次能要多少层：接口自己按 30 一页切，要更多就得翻页
 PB_PAGE_SIZE = 30
+# 翻页硬上限。max_floors 传 0 时语义是「不限制」，但**不能真的不限制**：
+# 服务端一旦忽略 pn 反复返回满页，或者帖子上万层，这里就会一直翻下去，
+# 楼层列表无限增长直到把内存吃光。20 页 = 600 层，远超实际用得上的深度
+# （配置上限是 60 层），纯粹是给循环一个出口。
+PB_MAX_PAGES = 20
 
 
 
@@ -97,6 +103,26 @@ def comment_from_proto(raw: dict[str, Any], *, author_name: str = "") -> StoneCo
     return StoneComment(author=who, text=text, is_author=False)
 
 
+def _floor_time_text(value: Any) -> str:
+    """把楼层时间统一成人读文本。
+
+    两条路线给的格式不一样：HTML 路线从页面里抠出来的本来就是
+    「2026-10-18 12:34」这样的文本，protobuf 给的是 Unix 秒。
+    以前直接把数字转成字符串塞进去，长图上那一层就显示成 1700000000。
+    小数字（< 1e9，多半是相对量或压根不是时间）原样留着。
+    """
+    text = str(value or "").strip()
+    if not text.isdigit():
+        return text
+    stamp = int(text)
+    if stamp < 1000000000:
+        return text
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp))
+    except (OSError, ValueError, OverflowError):
+        return text
+
+
 def floor_from_proto(raw: dict[str, Any], *, comment_author: str = "") -> StoneFloor:
     """把楼层字典转成 :class:`StoneFloor`。
 
@@ -106,7 +132,7 @@ def floor_from_proto(raw: dict[str, Any], *, comment_author: str = "") -> StoneF
         fn=int(raw.get("fn") or 0),
         author=str(raw.get("author") or "").strip() or comment_author,
         text=content_text(list(raw.get("content") or [])),
-        time=str(raw.get("time") or ""),
+        time=_floor_time_text(raw.get("time")),
         comment_total=int(raw.get("comment_total") or 0),
         agree=int(raw.get("agree") or 0),
     )
@@ -309,7 +335,8 @@ class StoneProtoClient:
         真能翻，所以 ``max_floors`` 超过 30 时会自动接着翻页，楼层号跨页累加。
 
         Args:
-            max_floors: 最多要几层（0 表示不限制，但接口本身有上限）。
+            max_floors: 最多要几层。0 表示不限制，此时只受翻页硬上限
+                （PB_MAX_PAGES 页）约束 —— 不能真的无限翻。
             max_chars: 单层正文最多留几个字（0 表示不截断）。
             max_comments: 每层最多要几条楼中楼；**0 表示不要楼中楼**
                 （跟 HTML 路线语义一致）。要楼中楼会额外带 ``with_floor=1``。
@@ -321,7 +348,10 @@ class StoneProtoClient:
         page = 1
         # 页面本身有总页数，但那个字段实测不可靠（恒等于每页条数），
         # 所以用「这一页解析出几条」自己判断要不要继续翻。
-        while True:
+        # 循环**必须**有个页数出口：want 为 0（不限制）时下面那些
+        # len(floors) >= want 的判断全部失效，只剩「这一页没满」一条退路，
+        # 而服务端忽略 pn、一直回满页时那条永远不会命中。
+        while page <= PB_MAX_PAGES:
             payload = build_page_request(
                 thread.tid,
                 page=page,
@@ -349,10 +379,14 @@ class StoneProtoClient:
             added = 0
             for item in page_floors:
                 floor = floor_from_proto(item)
-                if floor.fn and str(floor.fn) in seen_pid:
+                # 去重键用 **pid**，不能用 fn：fn 是 floor_number_base + idx + 1
+                # 现编的，每页 base 都不一样，同一个楼层翻两页拿回来 fn 天然不同，
+                # 按它去重等于没去重（服务端忽略 pn 时会把同一批帖子搬两遍）。
+                # 拿不到 pid 时才退回 fn 兜底。
+                key = str(item.get("pid") or "").strip() or ("fn:%s" % floor.fn)
+                if key in seen_pid:
                     continue
-                if floor.fn:
-                    seen_pid.add(str(floor.fn))
+                seen_pid.add(key)
                 if max_chars and len(floor.text) > max_chars:
                     floor.text = floor.text[:max_chars].rstrip() + "……"
                 floors.append(floor)
@@ -365,6 +399,14 @@ class StoneProtoClient:
                 # 这一页没满，说明到底了
                 break
             page += 1
+        else:
+            # 撞上翻页硬上限（while 是正常结束的，不是 break 出来的）。
+            logger.debug(
+                "[搬石/proto] 帖子 %s 翻到 %s 页硬上限就停了，已收 %s 层",
+                thread.tid,
+                PB_MAX_PAGES,
+                len(floors),
+            )
         detail.floors = floors
         if not floors:
             logger.debug("[搬石/proto] 帖子 %s 没解析出楼层（可能被删/结构变了）", thread.tid)

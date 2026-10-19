@@ -181,9 +181,9 @@ _KIND_TEXT = "text"
 _KIND_VIDEO = "video"
 # 工具调用最多一次搬几条（模型给大了就钳住，免得一次淹了整个群）
 _TOOL_MAX_COUNT = 5
-# 工具那一轮要改读配置的「工具」一节。_kind_override 本来就是「本轮临时生效的
-# 设置」，顺手借它背一个标记，不必再加一个实例属性；空串仍是「照配置走」。
-_TOOL_OPTIONS_FLAG = "__tool__"
+# 工具那一轮要改读配置的「工具」一节。以前把这个标记塞进 _kind_override，
+# 但 _kind_override 装的是「只搬哪种帖」（中文值或空串），永远等不到这个标记，
+# 于是工具节整节失效。现在单独用一个布尔量 _tool_round 背它。
 # 吧名允许的字符：中英文数字下划线加间隔号，长度限制跟贴吧本身差不多
 _FORUM_NAME_RE = re.compile(r"^[0-9A-Za-z_\u4e00-\u9fff·]{1,20}$")
 
@@ -209,7 +209,10 @@ _CARD_STYLE_PAGE = "贴吧原页面"
 # 补进页面的图按卡片宽留 820 像素就够清楚（页面里文字区就这么宽）
 _PAGE_VIEWPORT_WIDTH = 414
 _PAGE_VIEWPORT_HEIGHT = 900
-_PAGE_RENDER_TIMEOUT_MS = 60000
+# 25 秒。实测一台内存宽裕的机器渲染一页贴吧长图只要 2~5 秒，60 秒纯属浪费：真卡住时
+# 那 60 秒是白等的，而一帖要试两档、一轮要搬四帖，白等的时间会成倍放大成一整轮十几分钟。
+# 内存吃紧的机器上渲染进程会被内核反复回收，等再久也渲不出来，早放弃早换下一帖反而更快。
+_PAGE_RENDER_TIMEOUT_MS = 25000
 _PAGE_IMAGE_MAX_WIDTH = 820
 # 原页面模式要把页面里每个图片占位都补上，缺一张就是一个洞（补不到的占位会被 CSS 收掉，
 # 于是在长图里凭空少一张图）。所以这里不受 max_images 限制，只用这个硬上限兜住超长帖。
@@ -220,12 +223,15 @@ _PAGE_IMAGE_LIMIT = 80
 # 所以渲染完先按体积试，太大就降低设备缩放重渲几档；几档都还是太大就放弃这张。
 _PAGE_IMAGE_SOFT_LIMIT_BYTES = 6 * 1024 * 1024
 # 重渲时依次尝试的设备缩放（越小越省体积，但字也越糊）。
-_PAGE_RENDER_SCALES = (2.0, 1.5, 1.25, 1.0)
+# 只要两档：实测同一帖 2.0x 出 5.46 MB、1.5x 出 3.43 MB、1.0x 出 1.69 MB，上限是 6.000 MB。
+# 2.0x 离上限太近（再长一点的帖子必超），却是最慢的一档；1.5x 已经比手机屏清晰，够用。
+# 档数就是白等倍率：每多一档，渲染失败的帖就多耗一整个超时。
+_PAGE_RENDER_SCALES = (1.5, 1.0)
 # 渲染的 RPC 超时要在宿主渲染超时之上再留一点余量：让宿主自己先超时并回一个干净的
 # 错误，而不是这边先掐断 RPC 把一个还在跑的渲染丢掉。
 _RENDER_RPC_SLACK_MS = 15_000
-# 自绘卡片是本地 HTML（不联网），渲染快得多，给 45 秒足够。
-_CARD_RENDER_TIMEOUT_MS = 45_000
+# 自绘卡片是本地 HTML（不联网），正常一两秒就出来；同样不陪着卡 45 秒。
+_CARD_RENDER_TIMEOUT_MS = 25_000
 
 # 长图落盘目录（插件 data 目录下的 pages/）。
 #
@@ -238,7 +244,13 @@ _CARD_RENDER_TIMEOUT_MS = 45_000
 # 实测 4 张各 6MB 的长图（合计 23.4MB）进同一条转发，插件发出的帧仍只有 1.4KB。
 # 这条路能成是因为 NapCat 的 uriToLocalFile 明确认 file:// 前缀
 # （napcat.mjs 的 checkUriType：`uri.startsWith("file:")` -> Local，且本地文件
-# 原样使用不复制），已在 chatbot 测试组真机验证。
+# 原样使用不复制），已在真机验证。
+#
+# 代价是**协议端必须能按同一个绝对路径读到这张图**：路径只是字符串，
+# 插件不负责把字节送过去。协议端与宿主同机（NapCat 与 MaiBot 装在同一台
+# 机器上）时天然成立；协议端跑在容器里时必须把这个目录按相同路径挂进去
+# （`-v <宿主 pages 目录>:<同一路径>:ro`），否则协议端打开文件失败，图片
+# 静默不显示。这条在单机部署下永远不会暴露，换容器部署才踩得到。
 _PAGE_CACHE_FILENAME = "page_%s_%d.png"
 # 落盘前先认一眼文件头。渲染器偶尔会返回一段空壳或错误页文本，
 # 那种东西写进 pages/ 只会变成一堆协议端读不出来的垃圾（曾经因此在插件
@@ -293,6 +305,38 @@ def _quoted_command(text: str, command: str) -> bool:
         if command in shell.group(0):
             return True
     return False
+
+
+def _command_text(kwargs: dict[str, Any]) -> str:
+    """命令入口拿到的原始文本（宿主把被引用原文也拼在里面）。
+
+    宿主命令通道给的键名是 ``text``（src/plugin_runtime/component_query.py 的
+    ``_build_command_executor`` 里 ``invoke_args["text"] = processed_plain_text``），
+    不是 ``processed_plain_text``。以前按后者取，永远是空串，于是「引用内容里的
+    命令不算数」这道守卫从来没生效过。旧键名留着兜底。
+    """
+    for key in ("text", "processed_plain_text", "plain_text"):
+        value = kwargs.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _command_message_id(kwargs: dict[str, Any]) -> str:
+    """这条命令消息的 id，用来挡住重复投递。
+
+    宿主**不在顶层给 message_id**：它藏在 ``invoke_args["message"]`` 这个序列化
+    过的消息字典里（src/plugin_runtime/host/message_utils.py 的
+    ``MessageDict(message_id=...)``）。以前按顶层取，永远是空串，去重守卫形同虚设。
+    顶层没有就再往 message 里找一层。
+    """
+    direct = str(kwargs.get("message_id") or "").strip()
+    if direct:
+        return direct
+    message = kwargs.get("message")
+    if isinstance(message, dict):
+        return str(message.get("message_id") or "").strip()
+    return ""
 
 
 def _scoped_user_id(platform: Any, user_id: Any) -> str:
@@ -660,6 +704,10 @@ class StonePlugin(MaiBotPlugin):
     _client: Any = None
     _proto: Any = None
     _block: Any = None
+    # 这两项也要有类级兜底：_send_options / _filter_mode 会在任何一次发送里被读到，
+    # 缺了就是 AttributeError，而它们只由 on_load 建立。
+    _kind_override: str = ""
+    _tool_round: bool = False
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -683,6 +731,8 @@ class StonePlugin(MaiBotPlugin):
         self._seen_message_ids: deque[str] = deque(maxlen=64)
         # 工具调用期间临时指定的「只搬哪种帖」；空串表示照配置走
         self._kind_override: str = ""
+        # 本轮是不是模型调工具发起的那一轮：是则发送选项改读配置的「工具」一节
+        self._tool_round: bool = False
         # 上次真正扫过落盘目录的时刻，用来节流清理（落盘很频繁，扫目录很贵）
         self._page_cache_pruned_at: float = 0.0
         self._setup()
@@ -1122,11 +1172,14 @@ class StonePlugin(MaiBotPlugin):
         count: int = 0,
         only_kind: str = "",
         post_at: datetime | None = None,
+        tool_options: bool = False,
     ) -> str:
         """搬一轮。streams 给了就只发这些会话（手动模式），否则按群配置发。
 
         only_forums / count / only_kind 是工具调用时临时改「逛哪些吧、每个吧
-        搬几条、只要哪种帖」用的，其余一切照配置走 —— 工具不插手怎么发。
+        搬几条、只要哪种帖」用的。tool_options 表示这一轮由模型调工具发起，
+        发送相关选项（带不带原帖链接、长图最多几张图、只搬哪种帖）改读配置的
+        「工具」一节，其余照「发送」一节。
         """
         # 不能写成 if self._lock.locked(): return —— 检查和获取之间会让出控制权，
         # 两个调用可能同时通过检查，于是并行搬两轮。直接尝试获取才是原子的。
@@ -1141,6 +1194,7 @@ class StonePlugin(MaiBotPlugin):
             # 先装覆盖再判前置条件：下面任何一个提前 return 都不会走到 finally，
             # 漏装的话上一轮的「只发视频帖」会跟着漏到下一轮去。
             self._kind_override = only_kind or ""
+            self._tool_round = bool(tool_options)
             try:
                 if client is None or store is None:
                     return _RoundSummary("插件还没准备好，稍后再试", error=True)
@@ -1158,6 +1212,7 @@ class StonePlugin(MaiBotPlugin):
                 )
             finally:
                 self._kind_override = ""
+                self._tool_round = False
         finally:
             self._lock.release()
 
@@ -1235,6 +1290,8 @@ class StonePlugin(MaiBotPlugin):
                 break
 
         delivered = 0
+        # 真正落到群里的帖子数（不是「挑了几条」）。摘要按这个说，见下面的说明。
+        landed_posts = 0
         failed = 0
         host_error = ""
         # 真正收到帖子的会话。结束语只往这些会话补 —— 一句都没发出去的群
@@ -1259,8 +1316,15 @@ class StonePlugin(MaiBotPlugin):
                 delivered += 1
                 for thread, _detail in outcome:
                     skipped_tids.add(thread.tid)
-                if len(outcome) < len(collected):
-                    # 这个群至少收到了一条，结束语才有着落
+                # outcome 是「没发出去」的帖。反过来数一遍才是真正落到群里的条数。
+                # 以前摘要直接写「本轮搬了 len(collected) 条」，于是长图一张都没渲出来、
+                # 群里什么都没收到的那一轮，日志里照样写着「搬了 4 条，发到 1 个群」——
+                # 用户看着这行字、群里看着空，谁都不知道是渲染挂了。这是本轮踩的坑，
+                # 所以摘要必须按**真发出去的条数**说，不能按「挑了几条」说。
+                landed = len(collected) - len(outcome)
+                if landed > landed_posts:
+                    landed_posts = landed
+                if landed:
                     ok_streams.append(stream_id)
             # 只有「每个目标都收到了」才记「搬过了」。
             # 去重是帖子级的，任何一个群漏收都意味着它再也等不到这条 ——
@@ -1283,7 +1347,19 @@ class StonePlugin(MaiBotPlugin):
         elif not collected:
             summary = "本轮没有新帖可搬（要么都搬过了，要么没够门槛）"
         else:
-            summary = "本轮搬了 %d 条" % len(collected)
+            # 「挑了几条」和「真发出去几条」是两回事。全部长图都没渲出来的那一轮，
+            # 挑的条数是 4、发出去的是 0，日志要是只写前者，看日志的人会以为一切正常，
+            # 而群里其实什么也没有（这就是本轮云端踩的坑）。所以这里两条都写出来。
+            summary = "本轮挑了 %d 条" % len(collected)
+            if landed_posts:
+                summary = "本轮搬了 %d 条" % landed_posts
+                if landed_posts < len(collected):
+                    summary += "（另有 %d 条长图没渲出来，这轮没发）" % (
+                        len(collected) - landed_posts
+                    )
+            else:
+                summary += "，但一条也没发出去（长图都没渲出来）"
+                is_error = True
             if delivered:
                 # 说「群」而不是「会话」：这两个数以前是同一个，直到发现同一个群
                 # 可能占两行会话记录（见 _target_streams 的去重说明）。那时摘要
@@ -1485,11 +1561,15 @@ class StonePlugin(MaiBotPlugin):
         return html_detail
 
     def _filter_mode(self) -> str:
-        """当前生效的「只搬哪种帖」：工具调用时是它临时指定的，平时是配置值。"""
+        """当前生效的「只搬哪种帖」：工具调用时是它临时指定的，平时是配置值。
+
+        没有临时指定时走 _send_options()，这样工具那一轮读的是「工具」节的
+        thread_filter，定时/手动轮读「发送」节 —— 与 README 的说法一致。
+        """
         override = str(getattr(self, "_kind_override", "") or "")
         if override:
             return override
-        return str(getattr(self.config.send, "thread_filter", _FILTER_ALL) or _FILTER_ALL)
+        return str(getattr(self._send_options(), "thread_filter", _FILTER_ALL) or _FILTER_ALL)
 
     def _passes_filter(self, detail: Any) -> bool:
         """这条帖子符不符合「只搬哪种帖」（详情页兜底判断）。
@@ -1794,9 +1874,9 @@ class StonePlugin(MaiBotPlugin):
         那一节可以单独配（只发长图、不带链接之类），免得改工具的行为还得连手动
         搬的样式一起动。工具那一节没配到的项，回落到「发送」一节。
         """
-        # getattr 兜底：_kind_override 由 _setup 建立，用 object.__new__ 造出来的
-        # 测试桩没有它，缺了就当作「没打标记」。
-        if getattr(self, "_kind_override", "") == _TOOL_OPTIONS_FLAG:
+        # getattr 兜底：_tool_round 由 on_load 建立，用 object.__new__ 造出来的
+        # 测试桩没有它，缺了就当作「不是工具轮」。
+        if getattr(self, "_tool_round", False):
             return _ToolOptions(self.config)
         return self.config.send
 
@@ -2037,10 +2117,12 @@ class StonePlugin(MaiBotPlugin):
             # 同样盯着体积：自绘卡片比原页面短，但长帖切出来的分片一样可能超标，
             # 超了这张就发不出去。降档重渲，几档都还不行就放弃这帖。
             image_b64 = ""
+            card_reason = ""
             for scale in _PAGE_RENDER_SCALES:
                 try:
                     result = await self._render_card_html(html, scale)
                 except Exception as exc:  # noqa: BLE001
+                    card_reason = "%s: %s" % (type(exc).__name__, exc)
                     self.ctx.logger.warning(
                         "[搬石] 长图渲染抛异常（缩放 %s）：%s", scale, exc
                     )
@@ -2049,6 +2131,10 @@ class StonePlugin(MaiBotPlugin):
                 if isinstance(result, dict):
                     candidate = str(result.get("image_base64") or "")
                 if not candidate:
+                    if isinstance(result, dict) and not card_reason:
+                        card_reason = str(
+                            result.get("error") or result.get("message") or result
+                        )[:200]
                     continue
                 raw_bytes = len(candidate) * 3 // 4
                 if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
@@ -2061,7 +2147,10 @@ class StonePlugin(MaiBotPlugin):
                 )
             if not image_b64:
                 # 见上：渲不出来就跳过这帖，不补任何文字。
-                self.ctx.logger.warning("[搬石] 长图渲染失败或太大，这帖跳过")
+                self.ctx.logger.warning(
+                    "[搬石] 长图渲染失败或太大，这帖跳过%s",
+                    ("（%s）" % card_reason) if card_reason else "",
+                )
                 return [], []
             images.append(image_b64)
             paths.append(self._save_page_image(image_b64))
@@ -2073,7 +2162,7 @@ class StonePlugin(MaiBotPlugin):
         这条路径必须开 allow_network：页面样式表和图标都在 CDN 上，宿主渲染器默认断网。
 
         渲染完还要**看体积**。长图是一张要过 RPC 的图片，而图片在帧里 base64 存两份，
-        原文件上限只有 6.000 MiB；贴吧原页面又长又花，2 倍缩放出来的 PNG 轻易就 8~12MB。
+        原文件上限只有 6.000 MiB；贴吧原页面又长又花，高倍缩放出来的 PNG 轻易就 8~12MB。
         超限的话 ``ctx.send.image`` 会抛异常，用户那边一张图都看不到，而插件只是记一行
         日志 —— 等于白搬。所以大了就降档重渲（缩放越小体积越小，代价是字更糊），
         几档都还不行就放弃这张长图。
@@ -2085,28 +2174,59 @@ class StonePlugin(MaiBotPlugin):
         白等一场。所以这里直接用 ``call_host_method`` 把 RPC 超时也按渲染超时给足（这个
         私有通道不可用时退回 ``ctx.render.html2png``，见 :meth:`_call_render_capability`）。
         """
+        failed = 0
+        too_big = 0
+        last_reason = ""
         for scale in _PAGE_RENDER_SCALES:
+            started = time.monotonic()
             try:
                 result = await self._render_html2png(html, scale, _PAGE_RENDER_TIMEOUT_MS)
             except Exception as exc:  # noqa: BLE001
+                failed += 1
+                last_reason = "%s: %s" % (type(exc).__name__, exc)
                 self.ctx.logger.warning("[搬石] 原页面渲染抛异常（缩放 %s）：%s", scale, exc)
                 continue
+            elapsed = time.monotonic() - started
             image_b64 = ""
             if isinstance(result, dict):
                 image_b64 = str(result.get("image_base64") or "")
             if not image_b64:
+                # 宿主没抛异常却没给图，说明它自己判失败了（超时/浏览器挂了/参数被拒）。
+                # 以前的实现直接 continue，日志里只留下一句「降档后仍然太大」—— 明明一张图
+                # 都没渲出来，却报「太大」，把排查方向带偏。这里把宿主的原话记下来。
+                failed += 1
+                detail = ""
+                if isinstance(result, dict):
+                    detail = str(result.get("error") or result.get("message") or result)[:200]
+                else:
+                    detail = type(result).__name__ if result is not None else "None"
+                last_reason = "%.1fs 无图 (%s)" % (elapsed, detail)
+                self.ctx.logger.warning(
+                    "[搬石] 原页面渲染没拿到图（缩放 %s，耗时 %.1fs）：%s",
+                    scale,
+                    elapsed,
+                    detail,
+                )
                 continue
             # base64 长度反推原始字节：base64 是 4 个字符存 3 字节。
             raw_bytes = len(image_b64) * 3 // 4
             if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
                 return image_b64
+            too_big += 1
             self.ctx.logger.warning(
                 "[搬石] 原页面长图 %.1f MB 超过单张上限 %.1f MB，降档重渲：%sx",
                 raw_bytes / 1048576.0,
                 _PAGE_IMAGE_SOFT_LIMIT_BYTES / 1048576.0,
                 scale,
             )
-        self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这帖跳过")
+        if too_big:
+            self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这帖跳过")
+        else:
+            self.ctx.logger.warning(
+                "[搬石] 原页面长图没渲出来（%d 档全失败，最后一档：%s），这帖跳过",
+                failed,
+                last_reason or "未知",
+            )
         return ""
 
     async def _call_render_capability(self, payload: dict[str, Any], timeout_ms: int) -> Any:
@@ -2252,8 +2372,7 @@ class StonePlugin(MaiBotPlugin):
         只有标题的节点：标题节点前面已经发过，补出来的是重复内容，用户看到的
         是「同一帖出现两遍、其中一遍没正文」。
         """
-        cfg = self._send_options()
-        # 长图进不了这条聊天记录的帖子整帖放进 deferred，交回给调用方。
+# 长图进不了这条聊天记录的帖子整帖放进 deferred，交回给调用方。
         # **不能只把长图丢掉、再补一个提要节点** —— 标题节点上面已经
         # 发过了，补出来的那个只会是第二次标题，用户看到的就是「有的帖子重复
         # 发送，有的没内容」（``probe_stone213_forward_dup.py`` 复现的就是它）。
@@ -2266,7 +2385,6 @@ class StonePlugin(MaiBotPlugin):
         for position, (thread, detail) in enumerate(collected):
             first = len(nodes)
             payload = payloads.get(thread.tid) or {}
-            blobs: dict[str, str] = payload.get("blobs") or {}
             header = {"type": "text", "data": self._thread_header(thread)}
             nodes.append(
                 {
@@ -2508,6 +2626,7 @@ class StonePlugin(MaiBotPlugin):
                 count=want,
                 only_kind=only_kind,
                 trigger="工具",
+                tool_options=True,
             )
         )
         # 不在会话里播报「开始搬了」：成功是常态，只有出错才需要说话。
@@ -2537,8 +2656,15 @@ class StonePlugin(MaiBotPlugin):
         #      整段塞进 rest」这条路径，于是 sub 变空 → 被当成裸命令 →
         #      管理员直接搬一轮。引用场景下这就是「想查状态结果搬了一轮」。）
         #   \Z 代替 $ —— $ 认末尾那个换行之前的位置，会跨行匹配。
+        #
+        # 这里刻意用 public 而不是 operator：宿主的 operator 拦截发生在
+        # 插件 handler 之前（src/chat/message_receive/bot.py:295），判据只有
+        # [plugin] permission 和隐藏的 command_permissions，插件配置里那份
+        # 「管理员」名单根本没机会被读到 —— 用户在插件面板填了 QQ 号却被告知
+        # 「你没有权限使用此命令。」，就是这个原因。改成 public 由下面的
+        # _may_move / _may_maintain 自己判，名单语义才和面板一致。
         pattern=r"^[/／]搬石(?:[^\S\n]+(?P<sub>[^\s/／\]）)】」』]+))?(?:[^\S\n]+(?P<rest>[^\n\]）)】」』]*?))?[^\S\n]*[\]）)】」』]?\Z",
-        permission="operator",
+        permission="public",
     )
     async def handle_stone(self, **kwargs: Any) -> tuple[bool, str, int]:
         matched = kwargs.get("matched_groups") or {}
@@ -2549,7 +2675,7 @@ class StonePlugin(MaiBotPlugin):
             return False, "缺少聊天流 ID", 1
         # 引用一条写着「/搬石 …」的消息时，宿主会把被引用原文拼进这次文本，
         # 于是命令被"带"进来又执行一遍。检测到命令来自引用部分就放行不处理。
-        full_text = str(kwargs.get("processed_plain_text") or kwargs.get("plain_text") or "")
+        full_text = _command_text(kwargs)
         quoted = full_text and (
             _quoted_command(full_text, "/搬石") or _quoted_command(full_text, "／搬石")
         )
@@ -2558,7 +2684,7 @@ class StonePlugin(MaiBotPlugin):
             return True, "引用内容里的命令，已跳过", 1
         # 同一条消息只处理一次：宿主超时后重投、或引用带出同一条命令时，
         # 不能让同一句话再搬一轮。
-        message_id = str(kwargs.get("message_id") or "").strip()
+        message_id = _command_message_id(kwargs)
         if message_id:
             if message_id in self._seen_message_ids:
                 self.ctx.logger.info("[搬石] 同一条消息重复进入命令链，跳过：%s", message_id)
@@ -2567,8 +2693,15 @@ class StonePlugin(MaiBotPlugin):
         platform = str(kwargs.get("platform") or "")
         user_id = str(kwargs.get("user_id") or "")
         local_operator = kwargs.get("is_local_operator") is True
-        can_move = await self._may_move(platform, user_id, stream_id, local_operator)
-        is_admin = can_move or await self._may_maintain(
+        can_move = await self._may_move(
+            platform, user_id, stream_id, local_operator, str(kwargs.get("group_id") or "")
+        )
+        # 维护权限**不能**写成 ``can_move or await self._may_maintain(...)``：
+        # can_move 为真时 ``or`` 直接短路，_may_maintain 根本不会被调用，于是
+        # 「可搬石的群」里的任何群成员都被当成管理员 —— 能看状态、能清空全站
+        # 搬运记录、能解除反爬冷却。两条权限本来就是分开的（见 _may_maintain
+        # 的说明：可搬石的群只给搬运权限），这里必须单独问一次。
+        is_admin = await self._may_maintain(
             platform, user_id, stream_id, local_operator
         )
         low = sub.lower()
@@ -2577,22 +2710,22 @@ class StonePlugin(MaiBotPlugin):
                 return await self._cmd_move(stream_id)
             await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
             return True, "没有权限", 1
-        if low in ("帮助", "help", "?"):
+        if low in ("帮助",):
             await self.ctx.send.text(_HELP_TEXT, stream_id, storage_message=False)
             return True, "用法说明", 1
-        if low in ("状态", "status"):
+        if low in ("状态",):
             if not is_admin:
                 await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
             await self.ctx.send.text(self._status_text(), stream_id, storage_message=False)
             return True, "状态", 1
-        if low in ("重置", "reset"):
+        if low in ("重置",):
             if not is_admin:
                 await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
                 return True, "维护命令需要管理员权限", 1
             # 「/搬石 重置 冷却」单独用来解除反爬冷却：记录照旧留着，
             # 否则用户想把冷却清掉就只能连搬运记录一起清。
-            if rest in ("冷却", "block", "反爬"):
+            if rest in ("冷却", "反爬"):
                 if self._client is not None:
                     self._client.reset_block()
                 await self.ctx.send.text(
@@ -2610,21 +2743,6 @@ class StonePlugin(MaiBotPlugin):
                 storage_message=False,
             )
             return True, "记录已重置", 1
-        if low in ("搬", "搬石"):
-            if not is_admin:
-                await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
-                return True, "维护命令需要管理员权限", 1
-            return await self._cmd_move(stream_id)
-        if low in ("视频", "搬视频", "video"):
-            if not can_move:
-                await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
-                return True, "维护命令需要管理员权限", 1
-            return await self._cmd_move(stream_id, only_kind=_FILTER_VIDEO)
-        if low in ("图文", "搬图文", "图"):
-            if not is_admin:
-                await self.ctx.send.text(_MAINTENANCE_DENIED, stream_id, storage_message=False)
-                return True, "维护命令需要管理员权限", 1
-            return await self._cmd_move(stream_id, only_kind=_FILTER_TEXT)
         await self.ctx.send.text(
             "不认识的子命令，打「/搬石 帮助」看看。", stream_id, storage_message=False
         )
@@ -2638,7 +2756,8 @@ class StonePlugin(MaiBotPlugin):
         ),
         # 同一个正则套路，只把命令名换成「搬视频」，后缀仍收进 rest 备用。
         pattern=r"^[/／]搬视频[^\S\n]*(?P<rest>[^\n\]）)】」』]*?)[^\S\n]*[\]）)】」』]?\Z",
-        permission="operator",
+        # 同上：public + handler 内自判，避免宿主抢先拦截。
+        permission="public",
     )
     async def handle_video(self, **kwargs: Any) -> tuple[bool, str, int]:
         """「/搬视频」：只搬视频帖。
@@ -2657,6 +2776,7 @@ class StonePlugin(MaiBotPlugin):
             str(kwargs.get("user_id") or ""),
             stream_id,
             kwargs.get("is_local_operator") is True,
+            str(kwargs.get("group_id") or ""),
         )
         if not can_move:
             await self.ctx.send.text(_MOVE_DENIED, stream_id, storage_message=False)
@@ -2668,13 +2788,13 @@ class StonePlugin(MaiBotPlugin):
 
         返回 None 表示放行；返回三元组就是直接交给宿主的应答。
         """
-        full_text = str(kwargs.get("processed_plain_text") or kwargs.get("plain_text") or "")
+        full_text = _command_text(kwargs)
         if full_text and (
             _quoted_command(full_text, command) or _quoted_command(full_text, command.replace("/", "／"))
         ):
             self.ctx.logger.info("[搬石] 命令出现在被引用内容里，跳过：%r", full_text[:80])
             return True, "引用内容里的命令，已跳过", 1
-        message_id = str(kwargs.get("message_id") or "").strip()
+        message_id = _command_message_id(kwargs)
         if message_id:
             if message_id in self._seen_message_ids:
                 self.ctx.logger.info("[搬石] 同一条消息重复进入命令链，跳过：%s", message_id)
@@ -2711,6 +2831,7 @@ class StonePlugin(MaiBotPlugin):
         count: int = 0,
         only_kind: str = "",
         trigger: str = "手动",
+        tool_options: bool = False,
     ) -> None:
         """后台跑的那一轮：**只有出错**才往群里发一句说明。
 
@@ -2727,6 +2848,7 @@ class StonePlugin(MaiBotPlugin):
                 only_forums=only_forums,
                 count=count,
                 only_kind=only_kind,
+                tool_options=tool_options,
             )
         except asyncio.CancelledError:
             raise
@@ -2805,12 +2927,22 @@ class StonePlugin(MaiBotPlugin):
         parts.append("主程序终端")
         return "；".join(parts)
     async def _may_move(
-        self, platform: str, user_id: str, stream_id: str, local_operator: bool
+        self,
+        platform: str,
+        user_id: str,
+        stream_id: str,
+        local_operator: bool,
+        group_id: str = "",
     ) -> bool:
         """能不能用「搬石 / 搬视频」这类立刻搬运的命令。
 
         管理员、「可搬石的群」里的任何人、主程序终端，以及两张名单都留空时
         回落到宿主 ``[plugin] permission`` 名单。
+
+        ``group_id`` 是**群号**，由宿主单独给（``invoke_args["group_id"]``）。
+        不能拿 ``stream_id`` 当群号用 —— 那是宿主按 platform/account/群号算出来的
+        md5 会话 id，和面板里填的群号永远对不上，「可搬石的群」会整条失效。
+        只有宿主没给 group_id 时（例如私聊）才退回从 stream_id 里抠数字。
         """
         if local_operator:
             return True
@@ -2818,7 +2950,7 @@ class StonePlugin(MaiBotPlugin):
         uid = _clean_id(user_id)
         if uid and uid in _admin_ids(getattr(section, "admins", None)):
             return True
-        group = _clean_id(stream_id)
+        group = _clean_id(group_id) or _clean_id(stream_id)
         if group and group in _group_set(getattr(section, "allow_groups", None)):
             return True
         return await self._host_permission_allows(platform, user_id)

@@ -108,7 +108,9 @@ def image_data_uri(raw: bytes, *, max_width: int = 1080, quality: int = 85) -> s
         try:
             with Image.open(io.BytesIO(raw)) as im:
                 fmt = str(im.format or "").upper()
-                if fmt == "GIF":
+                if fmt == "GIF" and int(getattr(im, "n_frames", 1) or 1) > 1:
+                    # 动图转 JPEG 只会剩第一帧，只能原样发。单帧 GIF 继续往下走，
+                    # 否则它绕过 max_width，一张大 GIF 就能把整张长图撑爆截图上限。
                     return "data:image/gif;base64," + base64.b64encode(raw).decode("ascii")
                 work = im.convert("RGB")
                 width, height = work.size
@@ -156,18 +158,28 @@ def _comments_html(floor: Any, *, limit: int = 3) -> str:
         )
     if not items:
         return ""
-    total = int(getattr(floor, "comment_total", 0) or 0)
-    more = max(total - len(shown), 0)
+    try:
+        total = int(getattr(floor, "comment_total", 0) or 0)
+    except (TypeError, ValueError):
+        total = 0
+    # 用「真正画出来的条数」算剩余：挑出来但正文为空的那几条不会出现在图里，
+    # 按 pick_comments 的条数算会把「还有几条」少报。
+    more = max(total - len(items), 0)
     tail = '<div class="st-lzl-more">还有 %d 条评论</div>' % more if more else ""
     return '<div class="st-lzl">%s%s</div>' % ("".join(items), tail)
 
 
 def _floors_html(
     floors: list[Any], images: dict[str, str], *, max_images: int
-) -> tuple[str, int]:
-    """画楼层。返回（HTML, 用掉的图片张数）。"""
+) -> tuple[str, int, int]:
+    """画楼层。返回（HTML, 用掉的图片张数, 真正画出来的层数）。
+
+    层数要单独返回：空楼层（既没正文也没图）会被跳过，直接拿 len(floors) 报
+    会在标题上写成「本段 12 层」而图里只有 8 层。
+    """
     parts: list[str] = []
     used = 0
+    drawn = 0
     for floor in floors:
         text = str(getattr(floor, "text", "") or "").strip()
         picture_html: list[str] = []
@@ -192,8 +204,10 @@ def _floors_html(
         body = '<div class="st-text">%s</div>' % _esc(text) if text else ""
         parts.append(
             '<div class="st-floor">%s%s%s%s</div>'
-            % (head, body, "".join(picture_html), _comments_html(floor))        )
-    return "".join(parts), used
+            % (head, body, "".join(picture_html), _comments_html(floor))
+        )
+        drawn += 1
+    return "".join(parts), used, drawn
 
 
 def build_thread_html(
@@ -220,13 +234,13 @@ def build_thread_html(
     forum = str(getattr(thread, "forum", "") or "").strip() or "贴吧"
     title = str(getattr(thread, "title", "") or "").strip() or "（无标题）"
     replies = int(getattr(thread, "replies", 0) or 0)
-    body_html, used = _floors_html(list(floors), images or {}, max_images=max_images)
+    body_html, used, drawn = _floors_html(list(floors), images or {}, max_images=max_images)
     if not body_html:
         body_html = '<div class="st-floor"><div class="st-empty">这一段没有可显示的楼层</div></div>'
     suffix = ""
     if parts > 1:
         suffix = "（第 %d/%d 段）" % (int(part) + 1, int(parts))
-    meta = "<b>%d</b> 回复 · 本段 <b>%d</b> 层 · <b>%d</b> 图" % (replies, len(list(floors)), used)
+    meta = "<b>%d</b> 回复 · 本段 <b>%d</b> 层 · <b>%d</b> 图" % (replies, drawn, used)
     css = _CARD_CSS.replace("#ACCENT#", accent)
     css = css.replace("#WIDTH#", str(int(width or DEFAULT_WIDTH)))
     return (

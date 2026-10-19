@@ -49,6 +49,9 @@ def encode_varint(value: int) -> bytes:
         # protobuf 的负数用 10 字节补码表示；本插件要发的字段全是正数，
         # 真遇到负数是调用方算错了，直接报出来比默默发一串 0xFF 好。
         raise ProtobufError("varint 不接受负数：%r" % (value,))
+    if value >= 1 << 64:
+        # 超出 uint64 编出来是 11 字节，对端按 64 位读会读到一半就断。
+        raise ProtobufError("varint 超出 64 位：%r" % (value,))
     out = bytearray()
     while True:
         chunk = value & 0x7F
@@ -108,6 +111,8 @@ def _read_varint(buf: bytes, pos: int) -> "tuple[int, int]":
         if not byte & 0x80:
             return value, pos
         shift += 7
+        # 检查要在 shift 自增之后：先判再增的话第 10 个字节会被算成合法的，
+        # 而 64 位 varint 最多 10 字节（shift 到 63 为止）。
         if shift > _MAX_SHIFT:
             raise ProtobufError("varint 超过 64 位（偏移 %d）" % (pos,))
 

@@ -43,7 +43,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
@@ -159,6 +159,29 @@ _IMG_PLACEHOLDER_RE = re.compile(
 )
 _IMG_TAG_RE = re.compile(r"<img[^>]*>", re.I)
 _IMG_SRC_ATTR_RE = re.compile(r"""(?:data-original|data-src|src)=["'](?P<u>[^"']+)["']""", re.I)
+# 同一个 <img> 上这三个属性可能同时存在，取哪个有讲究（见 _best_image_src）
+_IMG_SRC_ANY_RE = re.compile(r"""\b(data-original|data-src|src)=["\'](?P<u>[^"\']+)["\']""", re.I)
+_IMG_SRC_PRIORITY = {"data-original": 0, "data-src": 1, "src": 2}
+
+
+def _best_image_src(tag: str) -> str:
+    """从 <img> 标签里挑出真正该用的那个地址（已反转义、已补全协议）。
+
+    懒加载的 img 常常同时挂着 ``data-src``（真图）和 ``src``（loading.gif 之类的
+    占位图）。以前只取第一个命中的属性，碰上 ``src`` 写在前面就取到占位图，
+    再被 UI 图过滤掉，整张图就这么丢了。这里按 data-original → data-src → src
+    的优先级挑，同级取先出现的那个。
+    """
+    best: tuple[int, int, str] | None = None
+    for m in _IMG_SRC_ANY_RE.finditer(tag or ""):
+        name = m.group(1).lower()
+        url = _html.unescape(m.group("u"))
+        if url.startswith("//"):
+            url = "https:" + url
+        rank = (_IMG_SRC_PRIORITY.get(name, 3), m.start())
+        if best is None or rank < best[:2]:
+            best = (rank[0], rank[1], url)
+    return best[2] if best else ""
 
 # 视频帖在 HTML 里留下三样东西，取哪一样是实测出来的（2026-10）：
 #   1) <a class="video" data-vhsrc=".../tieba-smallvideo/<hash>.mp4"> —— 不带签名的
@@ -457,12 +480,9 @@ def images_of(segment: str) -> tuple[list[str], list[str]]:
         thumbs.append(signed)
         origin.append(to_origin_image(direct) if direct else signed)
     for m in _IMG_TAG_RE.finditer(segment or ""):
-        src_m = _IMG_SRC_ATTR_RE.search(m.group(0))
-        if not src_m:
+        u = _best_image_src(m.group(0))
+        if not u:
             continue
-        u = _html.unescape(src_m.group("u"))
-        if u.startswith("//"):
-            u = "https:" + u
         if _is_ui_image(u) or not _image_host_ok(u):
             continue
         origin.append(to_origin_image(u))
@@ -509,9 +529,12 @@ def videos_of(segment: str) -> list[StoneVideo]:
     """取一段正文里的视频。
 
     转码直链在 ``span.net_search_url[data-vhsrc]`` 里，封面在 ``a.video > img`` 里。
-    两者按出现顺序配对；只有封面没有直链的也返回（调用方至少能提示「这层有视频」）。
+    两者按**字节位置就近**配对（见下）；只有封面没有直链的也返回（调用方至少能
+    提示「这层有视频」）。
     """
     out: list[StoneVideo] = []
+    # spots 与 out 一一对应：每个视频在原文里的字节位置，下面配封面要用
+    spots: list[int] = []
     for m in _VIDEO_TRANSCODE_RE.finditer(segment or ""):
         url = _html.unescape(m.group("u")).strip()
         if url.startswith("//"):
@@ -521,28 +544,36 @@ def videos_of(segment: str) -> list[StoneVideo]:
         if not _host_ok(url, VIDEO_HOSTS):
             continue
         out.append(StoneVideo(url=url))
-    # 封面按「DOM 顺序」配对：一路扫过去，遇到视频转码地址就起一个新视频，
-    # 遇到 video 块里的 <img> 就当成**当前这个**视频的封面。
-    # 以前是「先把所有封面收成一个平表，再按 idx 配」，只要某个 video 块里有
-    # 两张 img（播放图标 + 封面），整个序列就右移一位，封面全配错。
-    covers: list[tuple[str, str] | None] = []
+        spots.append(m.start())
+    # 封面按「位置就近」配对，不能用 idx：out 是按转码地址的顺序攒的，
+    # 而 a.video 块是另一个正则数出来的，两者数量本来就未必相等 —— 只要有一个
+    # 块因为域名不在白名单/没取到图被丢掉，按 idx 配对后面所有封面就整体错一位。
+    # 所以按字节偏移找「紧邻这个转码地址之前、且还没被用过」的那个块。
+    anchors: list[tuple[int, int, tuple[str, str] | None]] = []
     for m in _VIDEO_ANCHOR_RE.finditer(segment or ""):
         picked: tuple[str, str] | None = None
         for im in _IMG_TAG_RE.finditer(m.group("body")):
-            src_m = _IMG_SRC_ATTR_RE.search(im.group(0))
-            if not src_m:
+            u = _best_image_src(im.group(0))
+            if not u:
                 continue
-            u = _html.unescape(src_m.group("u"))
-            if u.startswith("//"):
-                u = "https:" + u
             if _is_ui_image(u):
                 continue
             picked = (to_origin_image(u), u)
             break  # 一个视频只要一张封面，后面的（播放图标等）不要
-        covers.append(picked)
+        anchors.append((m.start(), m.end(), picked))
+    used: set[int] = set()
     for idx, video in enumerate(out):
-        if idx < len(covers) and covers[idx] is not None:
-            video.cover, video.cover_thumb = covers[idx]
+        spot = spots[idx]
+        best = -1
+        for pos, (a_start, _a_end, picked) in enumerate(anchors):
+            if pos in used or picked is None:
+                continue
+            if a_start > spot:
+                break
+            best = pos
+        if best >= 0:
+            used.add(best)
+            video.cover, video.cover_thumb = anchors[best][2] or ("", "")
     return out
 
 
@@ -1234,20 +1265,43 @@ class StoneTiebaClient:
             if not _image_host_ok(cand):
                 logger.debug("[搬石/贴吧] 图片域名不在白名单，跳过：%s", cand)
                 continue
+            # 必须用流式：以前写成 await self._client.get(...)，httpx 返回前
+            # 会把整个响应体读进内存，下面那句 len(resp.content) > max_bytes 等于
+            # 事后诸葛 —— 图已经全下完了，max_bytes 一点保护作用都没有。一张
+            # 几十 MB 的巨图照样能把这一轮的内存和耗时吃光（和 _range_video_size
+            # 是同一类坑）。这里一边收一边数字节，超了立刻跳出、连接关掉。
             try:
-                resp = await self._client.get(cand, headers=headers)
+                async with self._client.stream("GET", cand, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        continue
+                    ctype = str(resp.headers.get("content-type") or "")
+                    if not ctype.startswith("image"):
+                        continue
+                    # 先看声明长度：能提前拒就提前拒，连第一块都不用收
+                    declared = _int_or_none(resp.headers.get("content-length"))
+                    if declared is not None and declared > max_bytes:
+                        logger.warning(
+                            "[搬石/贴吧] 图片声明 %s 字节超过上限 %s，跳过：%s",
+                            declared,
+                            max_bytes,
+                            cand,
+                        )
+                        continue
+                    buf = bytearray()
+                    async for chunk in resp.aiter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            break
             except Exception as exc:  # noqa: BLE001
                 logger.debug("[搬石/贴吧] 图片请求失败 %s：%s", cand, exc)
                 continue
-            if resp.status_code != 200 or not resp.content:
+            if not buf:
                 continue
-            ctype = str(resp.headers.get("content-type") or "")
-            if not ctype.startswith("image"):
-                continue
-            if len(resp.content) > max_bytes:
+            if len(buf) > max_bytes:
+                # 服务端没给 Content-Length（分块传输），只能收到超了才知道
                 logger.warning("[搬石/贴吧] 图片超过 %s 字节，跳过：%s", max_bytes, cand)
                 continue
-            return resp.content
+            return bytes(buf)
         logger.debug("[搬石/贴吧] 两个地址都没取到图：%s", url or thumb)
         return None
 

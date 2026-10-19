@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "mizuku003.tieba-share",
-  "version": "1.0.9",
+  "version": "1.1.1",
   "name": "麦麦贴吧搬石",
   "description": "把贴吧帖子搬进群：可选吧名，定时或手动，整帖渲染成长图，可打包成聊天记录，搬过的不会重复搬，也能让麦麦自己搬。",
   "author": {

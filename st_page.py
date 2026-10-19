@@ -3,11 +3,15 @@
 思路：不自己排版，直接取移动版帖子页的 HTML，去掉脚本、补上必需的样式，把正文插图换成
 我们自己下好的 base64 图，再交给宿主的渲染服务整页截图 —— 出来就是贴吧手机版的样子。
 
-两个必须知道的前提：
+三个必须知道的前提：
 
 1. 宿主渲染器默认不让页面联网。样式表、图标都在 CDN 上，所以调用方要显式开 allow_network。
+   既然要联网，页面上能主动发起请求的东西就得先清掉（见 _sanitize）：内联事件、
+   iframe/object/embed、meta refresh、javascript: 链接，一律不留。
 2. 帖子页默认只展开前两层，第 3 层起带 class_hide_flag（display:none）。这里注入 CSS 打开，
    并按 max_floors 把多余的楼层收掉。
+3. 首楼多图在 DOM 里只有 3 个格子，其余图只在内联 JS 的 contentTotal 里。脚本剥掉以后
+   那些图没有任何标签可换，只能补在拼贴块后面（见 _expand_first_floor_images）。
 
 这一层只做字符串处理，不联网、不依赖宿主，方便单独测。
 """
@@ -28,14 +32,26 @@ PAGE_WIDTH = 414
 _SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.I | re.S)
 _SCRIPT_OPEN_RE = re.compile(r"<script\b[^>]*>", re.I | re.S)
 _HEAD_OPEN_RE = re.compile(r"<head\b[^>]*>", re.I)
-_IMG_SRC_IN_TAG_RE = re.compile(
-    r"""(?:data-original|data-src|src)=["'](?P<u>[^"']+)["']""", re.I | re.S
-)
+_CLASS_ATTR_RE = re.compile(r"""\bclass=["']([^"']*)["']""", re.I)
 # 找「可能要补图的标签」：占位 div 和真 img，一次扫完
 _IMAGE_SPOT_RE = re.compile(r"<div\b[^>]*>|<img\b[^>]*>", re.I | re.S)
-# 首楼多图的拼贴块：服务端只渲染 3 个格子，其余图在 contentTotal 里
-_PB_IMGS_RE = re.compile(r"""<div[^>]*\bid=["']pb_imgs["'][^>]*>.*?</div>\s*</div>""", re.I | re.S)
+# 首楼多图的拼贴块开标签。收尾位置必须做标签配平算，不能拿正则数 </div>：
+# 格子里面还嵌着 <div class="pb_imgs_img"></div>，数到第一个就把整块截断了。
+_PB_IMGS_OPEN_RE = re.compile(r"""<div\b[^>]*\bid=["']pb_imgs["'][^>]*>""", re.I | re.S)
+_DIV_TAG_RE = re.compile(r"<div\b[^>]*>|</div\s*>", re.I | re.S)
+_DATA_URI_SRC_RE = re.compile(r"""(?:src|data-src|data-original)=["'](data:[^"']+)["']""", re.I)
 _PROTOCOL_RE = re.compile(r"""(?P<attr>\b(?:href|src|data-src|data-original)=)(?P<q>["'])//""", re.I)
+# 净化用：页面上能主动联网或跳转的东西
+_DANGEROUS_TAG_RE = re.compile(
+    r"<(?:iframe|frame|object|embed|applet)\b[^>]*>.*?</(?:iframe|frame|object|embed|applet)\s*>",
+    re.I | re.S,
+)
+_DANGEROUS_OPEN_RE = re.compile(r"<(?:iframe|frame|object|embed|applet)\b[^>]*/?>", re.I)
+_META_REFRESH_RE = re.compile(
+    r"""<meta\b[^>]*http-equiv\s*=\s*["']?refresh["']?[^>]*>""", re.I | re.S
+)
+_ON_ATTR_RE = re.compile(r"""\son[a-z]{3,}\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)""", re.I)
+_JS_HREF_RE = re.compile(r"""\b(?:href|src)\s*=\s*(["'])\s*javascript:[^"']*\1""", re.I)
 
 # 图片占位一律认「标签里有没有 data-url」，判据统一交给 st_tieba.images_of：
 #   正文插图 j_media_thumb_holder、单图首楼 pb_img_item、多图首楼 pb_imgs_top /
@@ -166,62 +182,115 @@ def _swap_placeholder(tag: str, pool: dict[str, str]) -> str:
 
 
 def _swap_img_tag(tag: str, pool: dict[str, str]) -> str:
-    """把真 ``<img>`` 的 src 换成下好的图。
+    """把真 ``<img>`` 换成我们下好的图。
 
     这里**不能**照搬 _swap_placeholder 换成 div —— img 是空元素、没有闭合标签，
     换成 div 会让整份文档的标签配平垮掉（渲染出来就是一片错位）。
     图没下到就整块收掉（加 style 隐藏），同样不留下灰框。
+
+    命中以后整条标签重建，而不是只改某一个属性的值：懒加载的 img 常常同时挂着
+    data-src（真图）和 src（loading.gif），而且属性里的 URL 还是 HTML 转义过的
+    （&amp; 之类），逐个属性比字符串既容易漏也容易错。重建时只留原 class 和 src。
     """
     if not images_of(tag)[1]:
         return tag
     uri = _lookup_uri(tag, pool)
     if not uri:
         return '<img class="st-page-miss-img" style="display:none!important">'
-    # 懒加载的 img 常常同时挂着 data-src（真图）和 src（占位/loading.gif），
-    # 浏览器最后看的是 src —— 只换一个的话长图里还是裂图。所以凡是值指向本次
-    # 这张图的属性命中全换掉（count=0），其余属性（class、宽高等）原样留着。
-    target = _lookup_key(tag, pool)
-    return _IMG_SRC_IN_TAG_RE.sub(
-        lambda m: m.group(0) if m.group("u") != target else m.group(0).replace(
-            m.group("u"), uri, 1
-        ),
-        tag,
-    )
+    cls = _CLASS_ATTR_RE.search(tag)
+    classes = "st-page-img"
+    if cls:
+        extra = " ".join(cls.group(1).split())
+        if extra and "st-page-img" not in extra.split():
+            classes = classes + " " + extra
+    return '<img class="%s" src="%s">' % (classes, uri)
 
 
-def _expand_first_floor_images(html: str, images: dict[str, str]) -> str:
-    """把首楼多图的「9图」拼贴块展开成全部图。
+def _div_block_end(html: str, start: int) -> tuple[int, int]:
+    """从 start（某个 ``<div`` 开标签的起点）起做标签配平，算出它自己的 ``</div>``。
+
+    Returns:
+        (闭合标签起点, 闭合标签终点)；配不平就是 (-1, -1)。
+
+    为什么不用正则：拼贴块的格子里面还嵌着 ``<div class="pb_imgs_img"></div>``，
+    按 ``</div>\\s*</div>`` 去数会在第一个格子上就收尾，补图区被塞进块内部。
+    """
+    depth = 0
+    for m in _DIV_TAG_RE.finditer(html, start):
+        if m.group(0).lower().startswith("</"):
+            depth -= 1
+            if depth <= 0:
+                return m.start(), m.end()
+        else:
+            depth += 1
+    return -1, -1
+
+
+def _replace_spots(html: str, pool: dict[str, str]) -> tuple[str, set[str]]:
+    """把页面里所有图片位置换成 data URI，返回 (新 HTML, 有位置的池键集合)。
+
+    自己走一遍扫描而不是 ``re.sub``：占位 div 里常常还嵌着一个 ``<img>``，
+    两次替换下来同一张图会渲两遍。这里一旦换掉占位 div，就连它内部一起吃掉，
+    只留下原来的 ``</div>`` 去收我们新开的那个 div。
+    """
+    out: list[str] = []
+    placed: set[str] = set()
+    pos = 0
+    for m in _IMAGE_SPOT_RE.finditer(html):
+        if m.start() < pos:
+            continue  # 落在已经被吃掉的占位块内部
+        tag = m.group(0)
+        key = _lookup_key(tag, pool)
+        if key:
+            placed.add(key)
+        if tag[:4].lower() == "<img":
+            out.append(html[pos : m.start()])
+            out.append(_swap_img_tag(tag, pool))
+            pos = m.end()
+            continue
+        if not images_of(tag)[1]:
+            # 容器 div：原样留着，里面的 img 还要单独处理
+            out.append(html[pos : m.start()])
+            out.append(tag)
+            pos = m.end()
+            continue
+        out.append(html[pos : m.start()])
+        out.append(_swap_placeholder(tag, pool))
+        # 内部内容整段丢掉，闭合标签留着收尾；配不平就只换开标签。
+        close_start, _close_end = _div_block_end(html, m.start())
+        pos = close_start if close_start >= 0 else m.end()
+    out.append(html[pos:])
+    return "".join(out), placed
+
+
+def _expand_first_floor_images(
+    html: str, images: dict[str, str], placed: set[str]
+) -> str:
+    """把首楼多图里「DOM 里根本没有」的那些图补在拼贴块后面。
 
     贴吧移动版对首楼多图只服务端渲染 3 个格子（pb_imgs_top / _bottom_left /
-    _bottom_right），外加一个写着「9图」的角标，其余 6 张**只在内联 JS 的
-    contentTotal 里**，DOM 里根本没有对应标签 —— 光靠替换占位（_swap_placeholder）
-    补不出来，长图里那层就只有 3 张。
+    _bottom_right），其余图**只在内联 JS 的 contentTotal 里**，DOM 里没有任何标签 ——
+    光靠替换占位补不出来，长图里那层就只有 3 张。
 
-    这里在拼贴块**后面**补一个补图区，把池子里还没出现在拼贴块里的图按顺序摆上，
-    并把角标上的「N图」改成真实张数。拼贴块本身保持原样（它还原贴吧观感）。
+    补什么：池子里**没有对应 DOM 位置**的图（``placed`` 之外的）。有位置但没下到的
+    不算 —— 那是故意隐藏的，挪到首楼反而打乱顺序。
     """
     if not images:
         return html
-    block = _PB_IMGS_RE.search(html)
+    block = _PB_IMGS_OPEN_RE.search(html)
     if not block:
         return html
-    # 拼贴块里的格子此刻已经换成了 data URI —— 只能按「src 的值」反查它对应池子里的
-    # 哪个键。绝不能拿值去重（两张不同的图理论上可能有同样的 URI，测试桩里更是
-    # 全都一样），那会把该补的图当成「已经在了」而整块不补。
-    by_uri: dict[str, list[str]] = {}
-    for key, uri in images.items():
-        by_uri.setdefault(uri, []).append(key)
-    shown_keys: set[str] = set()
-    for m in _IMG_SRC_IN_TAG_RE.finditer(block.group(0)):
-        uri = m.group("u")
-        if not uri.startswith("data:"):
-            continue
-        for key in by_uri.get(uri, ()):  # 同一个 URI 可能对应多个键，全部算已出现
-            shown_keys.add(key)
-    if not shown_keys:
+    _close_start, close_end = _div_block_end(html, block.start())
+    if close_end < 0:
         return html
-    # 池子是 dict、保序，顺序就是页面出现顺序；已经出现在拼贴块里的不再补
-    extra = [uri for key, uri in images.items() if key not in shown_keys]
+    present = {m.group(1) for m in _DATA_URI_SRC_RE.finditer(html)}
+    extra: list[str] = []
+    seen: set[str] = set()
+    for key, uri in images.items():
+        if key in placed or uri in present or uri in seen:
+            continue
+        seen.add(uri)
+        extra.append(uri)
     if not extra:
         return html
     add = "".join(
@@ -229,8 +298,23 @@ def _expand_first_floor_images(html: str, images: dict[str, str]) -> str:
         for uri in extra
     )
     insert = '<div class="st-page-img-extra">%s</div>' % add
-    at = block.end()
-    return html[:at] + insert + html[at:]
+    return html[:close_end] + insert + html[close_end:]
+
+
+def _sanitize(html: str) -> str:
+    """清掉页面上能主动联网或跳转的东西。
+
+    原页面模式必须开 allow_network（贴吧的样式和图都在 CDN 上），所以页面里任何
+    能自己发请求的元素都等于把渲染器当跳板。脚本已经整段剥掉，这里再补几刀：
+    iframe / frame / object / embed / applet、meta refresh、内联事件、javascript: 链接。
+    正常的 img / style / link 全部保留，观感不受影响。
+    """
+    html = _DANGEROUS_TAG_RE.sub("", html)
+    html = _DANGEROUS_OPEN_RE.sub("", html)
+    html = _META_REFRESH_RE.sub("", html)
+    html = _ON_ATTR_RE.sub("", html)
+    html = _JS_HREF_RE.sub("", html)
+    return html
 
 
 def build_page_html(
@@ -249,6 +333,7 @@ def build_page_html(
     # 脚本一去，页面只剩静态结构，截图时不会有弹窗和二次跳转
     html = _SCRIPT_RE.sub("", html)
     html = _SCRIPT_OPEN_RE.sub("", html)
+    html = _sanitize(html)
     # 协议相对地址（//tb1.bdstatic.com/...）在本地文档里没法解析，补成 https
     html = _PROTOCOL_RE.sub(lambda m: m.group("attr") + m.group("q") + "https://", html)
     head = _HEAD_OPEN_RE.search(html)
@@ -258,14 +343,6 @@ def build_page_html(
     else:
         html = inject + html
     pool = {str(k): str(v) for k, v in (images or {}).items() if v}
-
-    def _sub(m: "re.Match[str]") -> str:
-        tag = m.group(0)
-        if tag[:4].lower() == "<img":
-            return _swap_img_tag(tag, pool)
-        return _swap_placeholder(tag, pool)
-
-    html = _IMAGE_SPOT_RE.sub(_sub, html)
-    # 补图要在替换之后做：那时拼贴块里的 3 张已经换成 data URI，才认得出
-    # 「哪几张已经在了」，剩下的才是要补的。
-    return _expand_first_floor_images(html, pool)
+    html, placed = _replace_spots(html, pool)
+    # 补图要在替换之后做：先知道哪些池键有 DOM 位置，才知道哪些只能补在拼贴块后面。
+    return _expand_first_floor_images(html, pool, placed)

@@ -136,11 +136,18 @@ _FORWARD_TIMEOUT_MS = 300_000
 # 宿主的发送能力（`cap.call`）只要拿到返回值就算成功，它并不会告诉我们协议端
 # 有没有真的把消息投出去：签名过期、`401`、适配器拒收，在插件看起来都和成功
 # 一样。能观察到的失败只有两类 —— 抛异常（RPC 层断了、超时）和返回 None。
-# 这两类都值得再试一次：RPC 层偶发抖动的概率远高于「内容本身发不出去」。
 #
-# 但不能无限试：一轮搬运要发几十上百条，条条重试会把整轮的耗时翻几倍，
-# 而且真有结构性问题时（比如目标群被解散）重试一万次也没用。所以给三次。
+# **但重试本身就是重复的来源**。既然「失败」根本不能证明消息没发出去，那重试
+# 一次就是在赌「刚才那次真的没送出去」—— 赌输一次，群里就多一条一模一样的。
+# 聊天记录尤其明显：一条转发里装着一整轮内容，重试四次就是四条一样的记录
+# （issue #1 的「重复发送多次合并的聊天记录」）。
+#
+# 所以普通消息给 3 次（单条文字/图片重了也只是多一句话，丢一条反而更糟），
+# 而**合并转发只给 0 次**：它最慢、最容易超时，也最不该重复。
 _SEND_RETRY_TIMES = 3
+# 合并转发一次就够。转发是全轮最贵的一次调用，超时多半是「其实已经发出去了」，
+# 再试一遍就是在群里贴第二条同样的聊天记录。
+_FORWARD_RETRY_TIMES = 0
 # 两次重试之间等多久。**指数退避**：RPC 抖动通常几十毫秒就过去了，
 # 等 1 秒足够；真遇上宿主忙，2 秒、4 秒给足它缓过来。
 _SEND_RETRY_BASE_S = 1.0
@@ -627,7 +634,12 @@ class _SendGate:
     * run —— 调一次真的发送，失败就退避重试（失败判定见 run 的 docstring）。
 
     SDK 把发送能力的返回值归一成 ``bool``：``True`` 是发出去了，
-    ``False`` / ``None`` 都是没发成，两种都要重试。
+    ``False`` / ``None`` 都是没发成。
+
+    **但「没发成」并不等于「没送到」** —— 宿主的判定只是「RPC 这一趟拿到了
+    返回值」，协议端真投没投出去它不知道。所以重试是把双刃剑：抖动时救命，
+    超时时制造重复。默认给 3 次（单条消息重了只是多一句话），而合并转发这类
+    「一次顶一整轮、最慢最容易超时」的调用按次传 ``_retries=0``。
     """
 
     __slots__ = ("_tokens", "_at", "_rate", "_burst", "_retries", "_base")
@@ -658,7 +670,9 @@ class _SendGate:
                 return
             await asyncio.sleep((1.0 - self._tokens) / self._rate)
 
-    async def run(self, send: Any, *args: Any, **kwargs: Any) -> bool:
+    async def run(
+        self, send: Any, *args: Any, _retries: int | None = None, **kwargs: Any
+    ) -> bool:
         """限速发一条消息，失败退避重试。返回是否发出去了。
 
         **什么算失败**：SDK 把发送能力的返回值归一成 ``bool``
@@ -668,22 +682,30 @@ class _SendGate:
         所以：
 
         * ``True``  —— 发出去了；
-        * ``False`` —— **宿主明确说没发成**（缺参数、抛异常、平台拒绝），要重试；
+        * ``False`` —— **宿主明确说没发成**（缺参数、抛异常、平台拒绝）；
         * ``None``  —— 理论上不该出现（能力没被归一），按失败处理。
 
         以前这里写的是 ``ok is not None``，等于把 ``False`` 当成成功，
         「发失败就退而发链接」的兜底逻辑整个失效 —— 用户看到的是视频凭空消失。
         网关/适配器临时抽风返回 False 时重试一次往往就好了，这也是要重试的理由。
 
+        ``_retries`` 只覆盖**这一次调用**的重试次数（``0`` = 不重试），不传就用
+        建这个闸门时定的默认值。合并转发一律传 ``_FORWARD_RETRY_TIMES = 0``：
+        它最慢、最容易超时，而超时多半意味着「其实已经发出去了」，重试一次
+        群里就多一条一模一样的聊天记录。名字带下划线是为了不和转给 ``send``
+        的参数撞。
+
         Args:
             send: 真的发送函数（self.ctx.send.text 之类）。
             *args: 原样转给 send。
+            _retries: 只覆盖这一次调用的重试次数；None 用闸门默认值。
             **kwargs: 原样转给 send。
 
         Returns:
             发出去了是 True；重试用光还是没发成是 False。
         """
-        for attempt in range(self._retries + 1):
+        limit = self._retries if _retries is None else max(0, int(_retries))
+        for attempt in range(limit + 1):
             await self.wait()
             try:
                 ok = await send(*args, **kwargs)
@@ -695,7 +717,7 @@ class _SendGate:
                 ok = False
             if ok:
                 return True
-            if attempt >= self._retries:
+            if attempt >= limit:
                 return False
             # 指数退避：1s、2s、4s…，加抖动免得定时任务撞在一起。
             delay = self._base * (2 ** attempt) * random.uniform(0.8, 1.2)
@@ -1927,10 +1949,14 @@ class StonePlugin(MaiBotPlugin):
         collected: Sequence[tuple[Any, Any]],
         payloads: dict[str, dict[str, Any]],
     ) -> list[tuple[Any, Any]]:
-        """把本轮内容发到某个群。返回**没发出去**的帖子（长图没渲出来的那些）。
+        """把本轮内容发到某个群。返回**没发出去**的帖子。
 
-        调用方必须拿这个返回值去排除记账：这些帖一条都没到群里，记成
-        「已搬过」就是永久丢帖。
+        没发出去有两种：长图没渲出来，或者整条聊天记录没发成。两种都交回去
+        让调用方排除记账 —— 这些帖一条都没到群里，记成「已搬过」就是永久丢帖。
+
+        **内容只发一次，只在聊天记录里。** 转发不重试（`_FORWARD_RETRY_TIMES`），
+        失败也不把帖子拆开单独发 —— 拆出来就会变成「聊天记录外面的一份」，
+        正是 issue #1 抱怨的重复。
         """
         cfg = self._send_options()
         if cfg.forward:
@@ -1939,14 +1965,16 @@ class StonePlugin(MaiBotPlugin):
             nodes, overflow = await self._forward_nodes(collected, payloads)
             sent = False
             if nodes:
-                # 转发是最贵的一次发送（几十 MB 的帧），抖一下整轮内容就全没了，
-                # 所以它比单条消息更值得重试。超时给得也最宽。
+                # 转发是最贵的一次发送（几十 MB 的帧），但**恰恰不能重试**：
+                # 它慢、容易超时，而超时几乎都意味着「其实已经发出去了」。
+                # 重试一次，群里就多一条一模一样的聊天记录。
                 sent = await self._gate_of().run(
                     self.ctx.send.forward,
                     nodes,
                     stream_id,
                     timeout_ms=_FORWARD_TIMEOUT_MS,
                     storage_message=False,
+                    _retries=_FORWARD_RETRY_TIMES,
                 )
             # 装不进聊天记录的帖子**不补发**（不单独发长图，也不退发文字）：
             # 它们没到群里，交回去让 _run_locked 不记账，下一轮重来。补发出来的
@@ -1956,31 +1984,28 @@ class StonePlugin(MaiBotPlugin):
             if not nodes:
                 # 一条帖子都没能进记录（长图全没渲出来）：整轮不发。
                 return list(overflow)
-            if sent:
-                if overflow:
-                    self.ctx.logger.info(
-                        "[搬石] 有 %d 条帖子没能进聊天记录，这一轮不补发，留到下一轮",
-                        len(overflow),
-                    )
-                return list(overflow)
-            # 整条聊天记录压根没发出去是另一回事：那不是「装不下」，是这一次没
-            # 能送出去 —— ``nodes`` 里明明有内容，用户却什么都没收到。
-            missed = list(collected)
-            skipped: list[tuple[Any, Any]] = []
-            if missed:
-                self.ctx.logger.info(
-                    "[搬石] 聊天记录没发出去，有 %d 条帖子改单独发", len(missed)
+            if not sent:
+                # 整条聊天记录没发出去 —— **不补发**，这一轮就当没搬。
+                #
+                # 内容必须只在聊天记录里出现一次。一旦失败就逐帖单独发长图，
+                # 那几条就会以「聊天记录外面的一份」出现在群里 —— 正是 issue #1
+                # 说的「部分内容会在聊天记录之外重复发送」。而且这种补发只可能
+                # 在转发真的失败时触发，用户看到的是半截聊天记录加一堆散图，
+                # 比什么都不发更乱。
+                #
+                # 这几帖不记账（交回去让 _run_locked 排除），下一轮会自动重来，
+                # 所以不会永久丢帖。
+                self.ctx.logger.warning(
+                    "[搬石] 聊天记录没发出去，这 %d 条不单独补发，下一轮重搬",
+                    len(collected),
                 )
-                for thread, detail in missed:
-                    ok = await self._send_cards(
-                        stream_id, thread, detail, payloads.get(thread.tid) or {}
-                    )
-                    if not ok:
-                        # 长图没能渲出来。不补文字、不补图文 —— 那种"提要"在群里
-                        # 就是刷屏。这帖当没搬过，交回去让 _run_locked 不记账。
-                        skipped.append((thread, detail))
-                await self._send_videos(stream_id, missed, payloads)
-            return skipped
+                return list(collected)
+            if overflow:
+                self.ctx.logger.info(
+                    "[搬石] 有 %d 条帖子没能进聊天记录，这一轮不补发，留到下一轮",
+                    len(overflow),
+                )
+            return list(overflow)
         skipped = []
         for thread, detail in collected:
             ok = await self._send_cards(
@@ -2926,16 +2951,59 @@ class StonePlugin(MaiBotPlugin):
             raise
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[搬石] 手动轮次异常：%s", exc, exc_info=True)
+            # 报错信息写完整：异常类型 + 原始消息一个字都不删。直发到群里
+            # 一长条报错会刷屏，所以下面用聊天记录包起来 —— 正因为包起来了，
+            # 才有余地把它写全，不必为了短而截断。
             summary = _RoundSummary(
-                "这轮搬石出错了：%s（详细原因看主程序日志）" % exc, error=True
+                "这轮搬石出错了。\n\n%s: %s\n\n完整堆栈在主程序日志里。"
+                % (type(exc).__name__, exc),
+                error=True,
             )
         if not getattr(summary, "error", False):
             self.ctx.logger.info("[搬石] 手动一轮结束：%s", summary)
             return
         try:
-            await self.ctx.send.text(summary, stream_id, storage_message=False)
+            await self._send_report(stream_id, summary)
         except Exception as exc:  # noqa: BLE001
             self.ctx.logger.warning("[搬石] 手动结果发不出去：%s", exc)
+
+    async def _send_report(self, stream_id: str, text: str) -> None:
+        """把一条说明**打包成聊天记录**发进群，装不下才退回直发。
+
+        为什么要包起来：一轮失败的说明可能有好几行（异常类型、原始消息、
+        被贴吧拦住的原因……），直发就是一大坨文字顶在群里刷屏，而且发出去就
+        收不回来。聊天记录折叠成一条，点开才看得见，群里只多一行。
+
+        也正因为包起来了，报错信息可以写完整、不用截断 —— 直发时为了少刷屏
+        不得不压缩成一句话，反而看不出到底哪一步错了。
+
+        聊天记录发不出去（帧太大、宿主抖动）就退回直发：宁可刷屏，也不能让
+        用户以为「这轮什么都没发生」。这条兜底只走一次 —— 转发本身不重试
+        （``_FORWARD_RETRY_TIMES``），否则「没拿到回执」就会被放大成好几条。
+        """
+        forward = getattr(self.ctx.send, "forward", None)
+        if forward is not None:
+            nodes = [
+                {
+                    "nickname": self._forward_name(),
+                    "user_id": "",
+                    "segments": [{"type": "text", "data": str(text)}],
+                }
+            ]
+            ok = await self._gate_of().run(
+                forward,
+                nodes,
+                stream_id,
+                timeout_ms=_FORWARD_TIMEOUT_MS,
+                storage_message=False,
+                _retries=_FORWARD_RETRY_TIMES,
+            )
+            if ok:
+                return
+            self.ctx.logger.warning("[搬石] 说明的聊天记录没发出去，改成直发")
+        await self._gate_of().run(
+            self.ctx.send.text, str(text), stream_id, storage_message=False
+        )
 
     def _status_text(self) -> str:
         cfg = self.config

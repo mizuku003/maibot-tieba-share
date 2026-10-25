@@ -757,6 +757,9 @@ class StonePlugin(MaiBotPlugin):
     # 缺了就是 AttributeError，而它们只由 on_load 建立。
     _kind_override: str = ""
     _tool_round: bool = False
+    # 本轮「贴吧原页面」模式是否已判定渲不出来（见 :meth:`_card_images`）。
+    # 每轮开头复位，所以宿主修好、网络变好之后下一轮自己就会恢复。
+    _page_mode_down: bool = False
 
     # -- 生命周期 ---------------------------------------------------------
 
@@ -780,6 +783,8 @@ class StonePlugin(MaiBotPlugin):
         self._seen_message_ids: deque[str] = deque(maxlen=64)
         # 工具调用期间临时指定的「只搬哪种帖」；空串表示照配置走
         self._kind_override: str = ""
+        # 本轮「贴吧原页面」是否已判定渲不出来，见 :meth:`_card_images`
+        self._page_mode_down: bool = False
         # 本轮是不是模型调工具发起的那一轮：是则发送选项改读配置的「工具」一节
         self._tool_round: bool = False
         # 上次真正扫过落盘目录的时刻，用来节流清理（落盘很频繁，扫目录很贵）
@@ -1244,6 +1249,9 @@ class StonePlugin(MaiBotPlugin):
             # 漏装的话上一轮的「只发视频帖」会跟着漏到下一轮去。
             self._kind_override = only_kind or ""
             self._tool_round = bool(tool_options)
+            # 每轮重新给「贴吧原页面」一次机会：宿主升级了 playwright、网络变好了，
+            # 下一轮就该自己恢复成原页面，不必重启插件。
+            self._page_mode_down = False
             try:
                 if client is None or store is None:
                     return _RoundSummary("插件还没准备好，稍后再试", error=True)
@@ -2127,9 +2135,25 @@ class StonePlugin(MaiBotPlugin):
         两个列表一一对应：``paths[i]`` 是 ``images[i]`` 落盘后的 ``file://`` 路径，
         落盘失败时对应项是空串。转发节点优先用路径（帧里只有两百来字节、与图片
         体积无关），路径为空才退回 base64。
+
+        **「贴吧原页面」渲不出来就自动改用自绘卡片**，而不是丢掉这帖。原页面
+        这条路上有一个插件管不到的坑：宿主的网络路由回调用了
+        ``functools.partial(self._handle_network_route, allow_network=...)``，
+        而 playwright ≤1.60 的 ``wrap_handler`` 把 ``allow_network`` 也算进位置
+        参数个数，于是每个请求都抛 ``TypeError: got multiple values for argument
+        'allow_network'`` —— 88 个外链请求全部悬空，``load`` 永不触发，一路等到
+        超时。自绘卡片的图全是 ``data:`` 内嵌，页面零外链，那个回调一次都不会被
+        调用，所以完全绕得开。原页面模式下用户看到的就是「一张图都没有」，
+        而这帖明明还能用卡片发出去。
+
+        判定是**按轮**做的（``_page_mode_down``）：一旦本轮确认原页面这条路走不通，
+        后面几帖就不再白等一遍超时（每帖两档 x 一次超时就是好几分钟）；下一轮开头
+        复位，宿主升级 playwright 之后自己就恢复了。
         """
         cfg = self._send_options()
-        if _card_style(cfg) == _CARD_STYLE_PAGE:
+        if _card_style(cfg) == _CARD_STYLE_PAGE and not getattr(
+            self, "_page_mode_down", False
+        ):
             raw_html = str(getattr(detail, "raw", "") or "")
             if raw_html:
                 html = build_page_html(
@@ -2140,11 +2164,16 @@ class StonePlugin(MaiBotPlugin):
                 image_b64 = await self._render_page(html)
                 if image_b64:
                     return [image_b64], [self._save_page_image(image_b64)]
-                # 渲染失败**不补文字**：那种"提要"在群里就是刷屏，而且它既不完整
-                # 也不好看。这帖当没搬过，交回去下轮重试（渲染器多半只是临时抽风）。
-                self.ctx.logger.warning("[搬石] 原页面长图渲染失败，这帖跳过")
-                return [], []
-            self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
+                # 走到这里说明原页面这条路这一轮废了。**不丢帖**：标记降级，
+                # 让下面自绘卡片那段接手。只在本轮第一次降级时记一条，免得
+                # 每帖重复刷同一句话。
+                self._page_mode_down = True
+                self.ctx.logger.warning(
+                    "[搬石] 贴吧原页面渲不出来，本轮剩下的帖改用自绘卡片"
+                    "（若是宿主 playwright ≤1.60 的已知缺陷，升级到 1.61 以上即可恢复原页面）"
+                )
+            else:
+                self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
         uris: dict[str, str] = payload.get("uris") or {}
         sizes: dict[str, tuple[int, int]] = payload.get("sizes") or {}
         width = int(cfg.card_width)

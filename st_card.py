@@ -34,48 +34,55 @@ except Exception:  # noqa: BLE001
     _HAS_PIL = False
 
 DEFAULT_WIDTH = 830
-DEFAULT_ACCENT = "#e0a85c"
+# 贴吧手机版的主色。取色来自真实页面（tb1.bdstatic.com 的 common CSS 与
+# 渲染后的计算样式）：链接/强调 #3385ff、用户名 #3361a7、正文 #333333、
+# 次要文字 #a9aeb3、页面底色 #f2f3f5、楼层白卡 #ffffff、楼中楼灰底 #f5f5f5。
+DEFAULT_ACCENT = "#3385ff"
 
-
+# 卡片配色照贴吧手机版来：浅灰底 + 白色楼层卡 + 蓝色强调。以前是深色主题，
+# 和「贴吧原页面」模式出来的图完全是两种观感，用户切模式会以为换了个插件。
+# 楼层之间的 16px 灰缝用 border 实现而不是 margin —— margin 会被 #card 的
+# 边界吃掉，截图时看不到，两张卡就贴在一起了。
 _CARD_CSS = """
 * { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { background: #0e1015; }
+html, body { background: #f2f3f5; }
 #card {
   width: #WIDTH#px;
-  background: linear-gradient(180deg, #171a22 0%, #12141a 100%);
-  color: #e8e6e1;
+  background: #f2f3f5;
+  color: #333333;
   font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", system-ui, sans-serif;
-  padding-bottom: 6px;
+  padding-bottom: 16px;
 }
-.st-head { padding: 28px 32px 22px; border-bottom: 1px solid #ffffff14; }
-.st-tagline { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+.st-head { padding: 26px 28px 20px; background: #ffffff; border-bottom: 16px solid #f2f3f5; }
+.st-tagline { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
 .st-forum {
   font-size: 13px; font-weight: 700; letter-spacing: .5px;
-  color: #12141a; background: #ACCENT#; border-radius: 4px; padding: 3px 10px;
+  color: #ffffff; background: #ACCENT#; border-radius: 4px; padding: 3px 10px;
 }
-.st-kind { font-size: 12px; letter-spacing: 2px; color: #7d7a74; text-transform: uppercase; }
-.st-title { font-size: 27px; font-weight: 700; line-height: 1.42; color: #f2efe9; }
-.st-meta { margin-top: 12px; font-size: 13px; color: #8d8a84; }
+.st-kind { font-size: 12px; letter-spacing: 2px; color: #a9aeb3; text-transform: uppercase; }
+.st-title { font-size: 26px; font-weight: 700; line-height: 1.45; color: #222222; }
+.st-meta { margin-top: 12px; font-size: 13px; color: #a9aeb3; }
 .st-meta b { color: #ACCENT#; font-weight: 700; }
-.st-floor { padding: 20px 32px; border-bottom: 1px solid #ffffff10; }
+.st-floor { padding: 20px 28px; background: #ffffff; }
+.st-floor + .st-floor { border-top: 16px solid #f2f3f5; }
 .st-fhead { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
-.st-fn { font-size: 13px; font-weight: 700; color: #ACCENT#; }
-.st-author { font-size: 13px; color: #cfcbc2; }
-.st-time { margin-left: auto; font-size: 12px; color: #75726c; }
-.st-text { font-size: 15.5px; line-height: 1.8; color: #ddd9d1; white-space: pre-wrap; word-break: break-word; }
-.st-empty { font-size: 14px; color: #75726c; font-style: italic; }
-.st-img { display: block; width: 100%; height: auto; margin-top: 12px; border-radius: 8px; }
-/* 楼中楼：贴在楼层正文下面的一条条评论 */
-.st-lzl { margin-top: 12px; padding: 10px 14px; border-left: 3px solid #ffffff1f;
-  background: #ffffff08; border-radius: 0 8px 8px 0; }
-.st-lzl-item { font-size: 13.5px; line-height: 1.7; color: #b8b4ac; }
+.st-fn { font-size: 13px; font-weight: 700; color: #a9aeb3; }
+.st-author { font-size: 13.5px; font-weight: 600; color: #3361a7; }
+.st-time { margin-left: auto; font-size: 12px; color: #a9aeb3; }
+.st-text { font-size: 16px; line-height: 1.75; color: #333333; white-space: pre-wrap; word-break: break-word; }
+.st-empty { font-size: 14px; color: #a9aeb3; font-style: italic; }
+.st-img { display: block; width: 100%; height: auto; margin-top: 12px; border-radius: 6px; }
+/* 楼中楼：贴在楼层正文下面的一块浅灰圆角，跟贴吧手机版一致 */
+.st-lzl { margin-top: 14px; padding: 12px 14px; background: #f5f5f5; border-radius: 6px; }
+.st-lzl-item { font-size: 14px; line-height: 1.7; color: #333333; }
 .st-lzl-item + .st-lzl-item { margin-top: 7px; }
-.st-lzl-name { color: #ACCENT#; font-weight: 600; }
+.st-lzl-name { color: #3361a7; font-weight: 600; }
 .st-lzl-owner { color: #ACCENT#; font-weight: 700; }
-.st-lzl-more { margin-top: 8px; font-size: 12px; color: #75726c; font-style: italic; }
+.st-lzl-more { margin-top: 8px; font-size: 12.5px; color: #a9aeb3; }
 .st-foot {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 18px 32px 22px; font-size: 12px; color: #6f6c66;
+  padding: 18px 28px 20px; background: #ffffff; border-top: 16px solid #f2f3f5;
+  font-size: 12px; color: #a9aeb3;
 }
 .st-foot .st-brand { color: #ACCENT#; letter-spacing: 1px; }
 """

@@ -1305,6 +1305,47 @@ class StoneTiebaClient:
         logger.debug("[搬石/贴吧] 两个地址都没取到图：%s", url or thumb)
         return None
 
+    async def fetch_asset(
+        self,
+        url: str,
+        *,
+        referer: str = "",
+        max_bytes: int = 2 * 1024 * 1024,
+    ) -> bytes | None:
+        """取一个页面外链资源（样式表、装饰图），取不到返回 None。
+
+        和 :meth:`download_image` 有三处不同，都是为「一页几十个资源」准备的：
+
+        1. **不 sleep**。那些是 CDN 上的静态资源，不是贴吧的接口，一页要几十个，
+           每个都歇三秒就是几分钟；并发由调用方用信号量控住。
+        2. **不校验 content-type**。样式表是 text/css，不是图片。
+        3. **不记反爬冷却**。被拦了就是这一张没有，不该把整轮抓取停下来。
+
+        域名仍然只认贴吧图库那几个后缀：地址来自远端页面，不能让它把插件指到内网。
+        """
+        if not _image_host_ok(url):
+            logger.debug("[搬石/贴吧] 资源域名不在白名单，跳过：%s", url)
+            return None
+        headers = {
+            "User-Agent": self.user_agent,
+            "Referer": referer or TIEBA_ORIGIN + "/",
+        }
+        try:
+            # 流式收，超上限立刻停：这些地址来自远端页面，大小不能信它
+            async with self._client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code != 200:
+                    return None
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes(65536):
+                    buf.extend(chunk)
+                    if len(buf) > max_bytes:
+                        logger.debug("[搬石/贴吧] 资源超过 %d 字节，跳过：%s", max_bytes, url)
+                        return None
+                return bytes(buf) if buf else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[搬石/贴吧] 资源下载失败 %s：%s", url, exc)
+            return None
+
     async def probe_video_size(self, video: StoneVideo, *, referer: str = "") -> int | None:
         """问一下视频有多大，不下载视频本体。
 

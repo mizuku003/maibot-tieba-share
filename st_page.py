@@ -5,9 +5,11 @@
 
 三个必须知道的前提：
 
-1. 宿主渲染器默认不让页面联网。样式表、图标都在 CDN 上，所以调用方要显式开 allow_network。
-   既然要联网，页面上能主动发起请求的东西就得先清掉（见 _sanitize）：内联事件、
-   iframe/object/embed、meta refresh、javascript: 链接，一律不留。
+1. 样式表、图标原本都在 CDN 上。渲染前统一由 zero_net_html 收成零外链（内联 CSS、
+   图转 data:、砍 url()、盖 CSP），所以页面一个请求都不发 —— 既绕开宿主在
+   playwright <=1.60 上的路由回调缺陷，也比现场拉外链快。收之前先清掉页面上能主动
+   发起请求的东西（见 _sanitize）：内联事件、iframe/object/embed、meta refresh、
+   javascript: 链接，一律不留。
 2. 帖子页默认只展开前两层，第 3 层起带 class_hide_flag（display:none）。这里注入 CSS 打开，
    并按 max_floors 把多余的楼层收掉。
 3. 首楼多图在 DOM 里只有 3 个格子，其余图只在内联 JS 的 contentTotal 里。脚本剥掉以后
@@ -19,6 +21,7 @@
 from __future__ import annotations
 
 import re
+from html import escape as html_escape
 
 from st_tieba import images_of
 
@@ -304,10 +307,11 @@ def _expand_first_floor_images(
 def _sanitize(html: str) -> str:
     """清掉页面上能主动联网或跳转的东西。
 
-    原页面模式必须开 allow_network（贴吧的样式和图都在 CDN 上），所以页面里任何
-    能自己发请求的元素都等于把渲染器当跳板。脚本已经整段剥掉，这里再补几刀：
+    贴吧页面的样式和图原本都在 CDN 上，所以页面里任何能自己发请求的元素都等于把
+    渲染器当跳板。脚本已经整段剥掉，这里再补几刀：
     iframe / frame / object / embed / applet、meta refresh、内联事件、javascript: 链接。
-    正常的 img / style / link 全部保留，观感不受影响。
+    正常的 img / style / link 全部保留，观感不受影响，外链由 :func:`zero_net_html`
+    在渲染前统一收掉。
     """
     html = _DANGEROUS_TAG_RE.sub("", html)
     html = _DANGEROUS_OPEN_RE.sub("", html)
@@ -346,3 +350,152 @@ def build_page_html(
     html, placed = _replace_spots(html, pool)
     # 补图要在替换之后做：先知道哪些池键有 DOM 位置，才知道哪些只能补在拼贴块后面。
     return _expand_first_floor_images(html, pool, placed)
+
+
+# --- 零外链化 -------------------------------------------------------------------
+# 「贴吧原页面」这条路原先必须开 allow_network：样式表和图标都在 CDN 上。但宿主的
+# 网络路由回调在 playwright <=1.60 上必抛 TypeError（见 plugin._card_images 的说明），
+# 于是每一个外链请求都悬空、load 永不触发、一路等到超时。
+#
+# 解法不是关掉网络，而是把页面变成一个**一个请求都不发**的页面：样式表内联、装饰图
+# 转成 data:、CSS 里的 url() 全砍掉，最后再盖一张 CSP 兜底。这样路由回调一次都不会
+# 被调用，缺陷就绕过去了；而在 1.61 以上反而更快（省掉几十次外链往返）。
+#
+# 这一层仍然只做字符串处理：要下的资源由调用方下好传进来，这里只负责拼回去。
+
+# 换不上图时的占位：1x1 透明 GIF。不能用空串，空 src 在某些排版下会撑出一个框。
+BLANK_IMAGE = (
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"
+)
+# 兜底的网络策略：就算上面哪一步漏了一个外链，也让它止步于 CSP，不要变成悬空请求。
+_PAGE_CSP = (
+    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
+    "style-src 'unsafe-inline'; img-src data: blob:; font-src data:; "
+    'media-src data: blob:; script-src \'none\'">'
+)
+
+_LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.I | re.S)
+_REL_ATTR_RE = re.compile(r"""\brel\s*=\s*(?P<q>["'])(?P<v>.*?)(?P=q)""", re.I | re.S)
+_HREF_ATTR_RE = re.compile(r"""\bhref\s*=\s*(?P<q>["'])(?P<v>.*?)(?P=q)""", re.I | re.S)
+_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.I | re.S)
+_SRC_ATTR_RE = re.compile(r"""\bsrc\s*=\s*(?P<q>["'])(?P<v>.*?)(?P=q)""", re.I | re.S)
+# 属性值用反引用配对：值里允许出现另一种引号（URL 里 ?q="1" 这种），
+# 用 [^"']* 会在那个引号处截断，剩下的半截留在标签里把 HTML 弄坏。
+# srcset / data-src 里还留着原地址，浏览器会拿它去请求，所以一律摘掉
+_SRCSET_ATTR_RE = re.compile(
+    r"""\s(?:srcset|data-src|data-srcset|data-original)\s*=\s*(?:"[^"]*"|'[^']*')""",
+    re.I,
+)
+# CSS 里的 url()，但放过 data: —— 那些是我们自己嵌进去的图，砍了页面就空了
+_CSS_URL_RE = re.compile(r"""url\(\s*(?!['"]?data:)['"]?[^)'"]*['"]?\s*\)""", re.I)
+
+# 换图时把原地址留在这个属性上。贴吧靠属性选择器认图：
+#   .content img[src*="tb/editor"] { height: 16px }
+# src 一旦换成 data:，这类规则全部失配，表情就会按原图尺寸撑开。所以原地址要留下来，
+# 并把 CSS 里的 [src...] 一并改指到这个属性（见 _keep_src_selector）。
+_ORIG_SRC_ATTR = "data-orig-src"
+# 只认属性选择器里的 src：`[src]` `[src*=` `[src^=` `[src$=` `[src~=` `[src|=` `[src =`
+_CSS_SRC_SEL_RE = re.compile(r"\[\s*src\s*(?=[\]\^$*~|=])", re.I)
+_STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style\s*>)", re.I | re.S)
+
+
+def _keep_src_selector(css: str) -> str:
+    """把 CSS 里的 [src...] 属性选择器改指到 data-orig-src。
+
+    换图之后 src 已经是 data:，原样的选择器一条都命中不了，而页面的排版很依赖它们
+    （最典型的是表情高度）。原地址留在 data-orig-src 上，这里把选择器改成读那个属性，
+    匹配结果就和换图前一致。
+    """
+    return _CSS_SRC_SEL_RE.sub("[" + _ORIG_SRC_ATTR, str(css or ""))
+
+
+def _is_http(url: str) -> bool:
+    """地址是不是外链（http/https）。"""
+    low = (url or "").strip().lower()
+    return low.startswith("http://") or low.startswith("https://")
+
+
+def page_asset_urls(html: str) -> tuple[list[str], list[str]]:
+    """列出页面上的外链样式表和外链图片，各按出现顺序去重。
+
+    Returns:
+        (样式表 href 列表, 图片 src 列表)。
+    """
+    styles: list[str] = []
+    for tag in _LINK_TAG_RE.findall(html or ""):
+        rel = _REL_ATTR_RE.search(tag)
+        if not rel or "stylesheet" not in rel.group("v").lower():
+            continue
+        href = _HREF_ATTR_RE.search(tag)
+        href_url = href.group("v") if href else ""
+        if _is_http(href_url) and href_url not in styles:
+            styles.append(href_url)
+    images: list[str] = []
+    for tag in _IMG_TAG_RE.findall(html or ""):
+        src = _SRC_ATTR_RE.search(tag)
+        url = src.group("v") if src else ""
+        if _is_http(url) and url not in images:
+            images.append(url)
+    return styles, images
+
+
+def zero_net_html(
+    html: str,
+    *,
+    styles: dict[str, str] | None = None,
+    images: dict[str, str] | None = None,
+) -> str:
+    """把整页拼成零外链：样式表内联、装饰图换 data:、url() 全砍、盖 CSP。
+
+    Args:
+        html: :func:`build_page_html` 的产物（正文插图已经是 data: 了）。
+        styles: {样式表 href: CSS 文本}。没下到的样式表整段丢掉。
+        images: {图片 src: data URI}。没下到、超预算的换成 :data:`BLANK_IMAGE`。
+    """
+    html = str(html or "")
+    if not html:
+        return ""
+    style_map = {str(k): str(v) for k, v in (styles or {}).items() if v}
+    image_map = {str(k): str(v) for k, v in (images or {}).items() if v}
+
+    def _inline(match: "re.Match[str]") -> str:
+        tag = match.group(0)
+        rel = _REL_ATTR_RE.search(tag)
+        if not rel or "stylesheet" not in rel.group("v").lower():
+            return tag
+        href = _HREF_ATTR_RE.search(tag)
+        css = style_map.get(href.group("v"), "") if href else ""
+        if not css:
+            return ""
+        # 样式表里的背景图/图标也是外链，内联之后照样会发请求，所以要一起砍掉
+        return "<style>%s</style>" % _CSS_URL_RE.sub("none", css)
+
+    html = _LINK_TAG_RE.sub(_inline, html)
+
+    def _swap(match: "re.Match[str]") -> str:
+        tag = match.group(0)
+        src = _SRC_ATTR_RE.search(tag)
+        if not src:
+            return tag
+        url = src.group("v")
+        if not _is_http(url):
+            return tag
+        data = image_map.get(url) or BLANK_IMAGE
+        # 原地址必须留下：CSS 里的 [src*=...] 改写后要靠它命中
+        keep = ' %s="%s"' % (_ORIG_SRC_ATTR, html_escape(url, quote=True))
+        # 整条 src 属性重建，引号沿用原来的那种，其余属性一个不动
+        q = src.group("q")
+        return tag[: src.start()] + "src=" + q + data + q + keep + tag[src.end() :]
+
+    html = _IMG_TAG_RE.sub(_swap, html)
+    html = _SRCSET_ATTR_RE.sub("", html)
+    # 页面自带的 <style> 和上面内联进来的样式表，里面的 [src...] 都要跟着改
+    html = _STYLE_BLOCK_RE.sub(
+        lambda m: m.group(1) + _keep_src_selector(m.group(2)) + m.group(3), html
+    )
+    # 内联 style 和残留 CSS 里的 url() 也要砍：那是最难找的一类外链
+    html = _CSS_URL_RE.sub("none", html)
+    head = _HEAD_OPEN_RE.search(html)
+    if head:
+        return html[: head.end()] + _PAGE_CSP + html[head.end() :]
+    return _PAGE_CSP + html

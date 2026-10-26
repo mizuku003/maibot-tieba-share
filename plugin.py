@@ -46,6 +46,17 @@ _DEFAULT_FORWARD_NAME = "？！石！？"
 _TIMEOUT_HINTS = ("timeout", "timed out", "超时", "e_timeout")
 
 
+def _mime_of_image(body: bytes) -> str:
+    """按文件头猜图片 MIME。猜不出就按 JPEG —— 贴吧 CDN 上绝大多数是 JPEG。"""
+    if body[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if body[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
 def _looks_like_timeout(text: str) -> bool:
     """判断一条渲染失败信息是不是「等超时了」。
 
@@ -95,7 +106,12 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType  # noqa: E402
 
 from st_card import build_thread_html, image_data_uri  # noqa: E402
 from st_config import StoneConfig, in_quiet_hours, migrate_config, resolve_forums  # noqa: E402
-from st_page import build_page_html, placeholder_urls  # noqa: E402
+from st_page import (  # noqa: E402
+    build_page_html,
+    page_asset_urls,
+    placeholder_urls,
+    zero_net_html,
+)
 from st_store import StoneStore  # noqa: E402
 from st_fetch import BlockState, StoneProtoClient, thread_from_proto  # noqa: E402
 from st_tieba import (  # noqa: E402
@@ -226,6 +242,13 @@ def _thread_kind(value: Any) -> str:
 # 长图样式：自绘卡片（插件排版）/ 贴吧原页面（整页原样截图）
 _CARD_STYLE_CARD = "自绘卡片"
 _CARD_STYLE_PAGE = "贴吧原页面"
+# 「贴吧原页面」的两种渲染方式（配置项 send.page_render）。
+# * 零外链：插件先把样式表和装饰图内嵌成 data:、盖一条禁止外链的 CSP，页面一个
+#   请求都不发。任何主程序版本都能出图 —— 这是默认值。
+# * 原生：把原始页面直接丢给宿主浏览器，让它自己加载外链。只有 playwright >=1.61
+#   才正常；<=1.60 会因为宿主那个路由回调缺陷每个请求都报错、最后超时。
+_PAGE_RENDER_ZERO = "零外链"
+_PAGE_RENDER_RAW = "原生"
 # 原页面模式的截图参数：按手机屏宽截、允许联网去取 CDN 上的样式表、
 # 补进页面的图按卡片宽留 820 像素就够清楚（页面里文字区就这么宽）
 _PAGE_VIEWPORT_WIDTH = 414
@@ -244,16 +267,27 @@ _PAGE_IMAGE_MAX_WIDTH = 820
 # 原页面模式要把页面里每个图片占位都补上，缺一张就是一个洞（补不到的占位会被 CSS 收掉，
 # 于是在长图里凭空少一张图）。所以这里不受 max_images 限制，只用这个硬上限兜住超长帖。
 _PAGE_IMAGE_LIMIT = 80
-# 单张长图也走 RPC，而图片在帧里要 base64 两份（见 _FORWARD_FRAME_BUDGET_BYTES 的
-# 说明），所以一张长图的**原文件**上限是 6.000 MiB。渲染出来的 PNG 是纯色块居多的
-# 截图，很容易就 8~12MB —— 超了这张图压根发不出去，而且是抛异常、用户什么都看不到。
-# 所以渲染完先按体积试，太大就降低设备缩放重渲几档；几档都还是太大就放弃这张。
-_PAGE_IMAGE_SOFT_LIMIT_BYTES = 6 * 1024 * 1024
-# 重渲时依次尝试的设备缩放（越小越省体积，但字也越糊）。
-# 只要两档：实测同一帖 2.0x 出 5.46 MB、1.5x 出 3.43 MB、1.0x 出 1.69 MB，上限是 6.000 MB。
-# 2.0x 离上限太近（再长一点的帖子必超），却是最慢的一档；1.5x 已经比手机屏清晰，够用。
-# 档数就是白等倍率：每多一档，渲染失败的帖就多耗一整个超时。
-_PAGE_RENDER_SCALES = (1.5, 1.0)
+# 零外链化的预算（见 :meth:`_localize_page`）。原页面除了正文插图，还有几十个界面
+# 装饰图（头像框、表情、等级图标、底部按钮）散在 CDN 上。实测一页去重后二十来个、
+# 合计几百 KB，所以 2 MiB 的总预算绰绰有余；单图 512 KiB 是给那张躲在红包弹窗里、
+# 用户根本看不见的大图设的闸 —— 它一张就 673 KB，占掉三分之一的预算。
+_PAGE_ASSET_BUDGET_BYTES = 2 * 1024 * 1024
+_PAGE_ASSET_MAX_BYTES = 512 * 1024
+_PAGE_CSS_MAX_BYTES = 512 * 1024
+# 并发数。贴吧 CDN 吃得下这个量级，实测二十多个资源 0.8~1.6 秒就下完；
+# 再往上加没有收益，反而更容易撞上 CDN 的限速。
+_PAGE_ASSET_CONCURRENCY = 8
+# 长图**发送**走的是本地路径，不占帧（见 _send_page_image），所以「图太大发不出去」
+# 这条不成立。真正存在上限的只有一次：渲染结果从宿主回插件那一次 RPC ——
+# transport/base.py 的 MAX_FRAME_SIZE 是 16 MiB，而结果里放的是 base64（膨胀 4/3），
+# 于是**原图约 12 MB 是硬顶**，超了宿主直接抛 ValueError，用户一张图都看不到。
+# 留一点余量给 JSON 包装字段，按 11.5 MiB 算。
+_PAGE_IMAGE_HARD_LIMIT_BYTES = int(11.5 * 1024 * 1024)
+# 长图渲染倍率，固定 1.5。这里以前是一圈「渲出来太大就降档重渲」的循环，
+# 已经删掉 —— 降档是**再渲一遍**，总时间只会更长；实测 1.5x 换 1.0x 只省
+# 0.15 秒，而一整轮真实耗时 1.7~2.4 秒里零外链化下载就占 0.8~1.07 秒，
+# 真正慢的是网络。拿一张肉眼可见更糊的图去换这 0.15 秒不划算。
+_PAGE_RENDER_SCALE = 1.5
 # 渲染的 RPC 超时要在宿主渲染超时之上再留一点余量：让宿主自己先超时并回一个干净的
 # 错误，而不是这边先掐断 RPC 把一个还在跑的渲染丢掉。
 _RENDER_RPC_SLACK_MS = 15_000
@@ -523,6 +557,13 @@ def _card_style(cfg: Any) -> str:
     if str(getattr(cfg, "card_style", "") or "") == _CARD_STYLE_PAGE:
         return _CARD_STYLE_PAGE
     return _CARD_STYLE_CARD
+
+
+def _page_render(cfg: Any) -> str:
+    """读「贴吧原页面」的渲染方式。认不出来就按零外链走（对主程序版本无要求）。"""
+    if str(getattr(cfg, "page_render", "") or "") == _PAGE_RENDER_RAW:
+        return _PAGE_RENDER_RAW
+    return _PAGE_RENDER_ZERO
 
 
 def _select_floor_images(
@@ -963,7 +1004,10 @@ class StonePlugin(MaiBotPlugin):
     def _mode_label(self) -> str:
         cfg = self.config.send
         # 长图是唯一的内容形态，没有开关 —— 关掉它就没有任何东西可发了。
-        label = "长图（贴吧原页面）" if _card_style(cfg) == _CARD_STYLE_PAGE else "长图"
+        if _card_style(cfg) == _CARD_STYLE_PAGE:
+            label = "长图（贴吧原页面·%s）" % _page_render(cfg)
+        else:
+            label = "长图（自绘卡片）"
         if cfg.forward:
             label += "（打包成聊天记录）"
         return label
@@ -2136,19 +2180,23 @@ class StonePlugin(MaiBotPlugin):
         落盘失败时对应项是空串。转发节点优先用路径（帧里只有两百来字节、与图片
         体积无关），路径为空才退回 base64。
 
-        **「贴吧原页面」渲不出来就自动改用自绘卡片**，而不是丢掉这帖。原页面
-        这条路上有一个插件管不到的坑：宿主的网络路由回调用了
+        **「贴吧原页面」渲不出来就自动改用自绘卡片**，而不是丢掉这帖。
+
+        这条兜底原本是为了绕开宿主的一个坑：网络路由回调用了
         ``functools.partial(self._handle_network_route, allow_network=...)``，
         而 playwright ≤1.60 的 ``wrap_handler`` 把 ``allow_network`` 也算进位置
         参数个数，于是每个请求都抛 ``TypeError: got multiple values for argument
-        'allow_network'`` —— 88 个外链请求全部悬空，``load`` 永不触发，一路等到
-        超时。自绘卡片的图全是 ``data:`` 内嵌，页面零外链，那个回调一次都不会被
-        调用，所以完全绕得开。原页面模式下用户看到的就是「一张图都没有」，
-        而这帖明明还能用卡片发出去。
+        'allow_network'`` —— 外链请求全部悬空，``load`` 永不触发，一路等到超时，
+        用户看到的就是「一张图都没有」。自绘卡片的图全是 ``data:`` 内嵌，页面零
+        外链，那个回调一次都不会被调用，所以完全绕得开。
+
+        1.1.7 起原页面自己也零外链了（见 :meth:`_localize_page`），正常路径上已经
+        踩不到那个坑，所以这条降级现在只是兜底：装饰图全下不动、宿主渲染器本身
+        出问题、CSP 之外还有漏网请求时才会走到。
 
         判定是**按轮**做的（``_page_mode_down``）：一旦本轮确认原页面这条路走不通，
         后面几帖就不再白等一遍超时（每帖两档 x 一次超时就是好几分钟）；下一轮开头
-        复位，宿主升级 playwright 之后自己就恢复了。
+        复位，宿主那边恢复之后自己就好了。
         """
         cfg = self._send_options()
         if _card_style(cfg) == _CARD_STYLE_PAGE and not getattr(
@@ -2161,17 +2209,24 @@ class StonePlugin(MaiBotPlugin):
                     images=payload.get("page") or {},
                     max_floors=int(self.config.fetch.max_floors),
                 )
-                image_b64 = await self._render_page(html)
+                image_b64 = await self._render_page(html, _page_render(cfg))
                 if image_b64:
                     return [image_b64], [self._save_page_image(image_b64)]
                 # 走到这里说明原页面这条路这一轮废了。**不丢帖**：标记降级，
                 # 让下面自绘卡片那段接手。只在本轮第一次降级时记一条，免得
                 # 每帖重复刷同一句话。
                 self._page_mode_down = True
-                self.ctx.logger.warning(
-                    "[搬石] 贴吧原页面渲不出来，本轮剩下的帖改用自绘卡片"
-                    "（若是宿主 playwright ≤1.60 的已知缺陷，升级到 1.61 以上即可恢复原页面）"
-                )
+                if _page_render(cfg) == _PAGE_RENDER_RAW:
+                    self.ctx.logger.warning(
+                        "[搬石] 贴吧原页面渲不出来，本轮剩下的帖改用自绘卡片"
+                        "（「原页面渲染方式」设成了「原生」，主程序的 Playwright 需要在 "
+                        "1.61 以上；改回「零外链」即可，下一轮会自动重试原页面）"
+                    )
+                else:
+                    self.ctx.logger.warning(
+                        "[搬石] 贴吧原页面渲不出来，本轮剩下的帖改用自绘卡片"
+                        "（装饰图下载失败或宿主渲染器异常时会出现，下一轮会自动重试原页面）"
+                    )
             else:
                 self.ctx.logger.warning("[搬石] 没留下页面原文，这条改用自绘卡片")
         uris: dict[str, str] = payload.get("uris") or {}
@@ -2195,59 +2250,51 @@ class StonePlugin(MaiBotPlugin):
                 part=index,
                 parts=len(chunks),
             )
-            # 同样盯着体积：自绘卡片比原页面短，但长帖切出来的分片一样可能超标，
-            # 超了这张就发不出去。降档重渲，几档都还不行就放弃这帖。
-            # 但**只有「渲出来了但太大」才降档**：渲染本身失败（超时/浏览器崩）时
-            # 降档救不了它，再试一遍只是把白等翻倍（同 :meth:`_render_page`）。
-            # 同一档上给瞬时故障留一次重试，超时不重试 —— 理由见 :meth:`_render_page`。
+            # 自绘卡片比原页面短，但长帖切出来的分片一样可能超标。不过和原页面一样，
+            # **不降档**：降档是再渲一遍，总时间只会更长，省下的那点体积也没意义 ——
+            # 长图发送走本地路径，不占帧，真正的上限只有 RPC 帧的 12 MB 硬顶。
+            # 同一档上给瞬时故障留一次重试，超时不重试（理由见 :meth:`_render_page`）。
             image_b64 = ""
             card_reason = ""
-            for scale in _PAGE_RENDER_SCALES:
-                for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
-                    try:
-                        result = await self._render_card_html(html, scale)
-                    except Exception as exc:  # noqa: BLE001
-                        card_reason = "%s: %s" % (type(exc).__name__, exc)
-                        self.ctx.logger.warning(
-                            "[搬石] 长图渲染抛异常（缩放 %s，第 %d 次）：%s",
-                            scale,
-                            attempt + 1,
-                            exc,
-                        )
-                        if (
-                            _looks_like_timeout(card_reason)
-                            or attempt >= _RENDER_TRANSIENT_RETRY
-                        ):
-                            break
-                        await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
-                        continue
-                    candidate = ""
-                    if isinstance(result, dict):
-                        candidate = str(result.get("image_base64") or "")
-                    if not candidate:
-                        if isinstance(result, dict) and not card_reason:
-                            card_reason = str(
-                                result.get("error") or result.get("message") or result
-                            )[:200]
-                        if _looks_like_timeout(card_reason) or attempt >= (
-                            _RENDER_TRANSIENT_RETRY
-                        ):
-                            break
-                        await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
-                        continue
-                    image_b64 = candidate
+            for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
+                try:
+                    result = await self._render_card_html(html, _PAGE_RENDER_SCALE)
+                except Exception as exc:  # noqa: BLE001
+                    card_reason = "%s: %s" % (type(exc).__name__, exc)
+                    self.ctx.logger.warning(
+                        "[搬石] 长图渲染抛异常（第 %d 次）：%s", attempt + 1, exc
+                    )
+                    if _looks_like_timeout(card_reason) or attempt >= (
+                        _RENDER_TRANSIENT_RETRY
+                    ):
+                        break
+                    await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+                    continue
+                candidate = ""
+                if isinstance(result, dict):
+                    candidate = str(result.get("image_base64") or "")
+                if not candidate:
+                    if isinstance(result, dict) and not card_reason:
+                        card_reason = str(
+                            result.get("error") or result.get("message") or result
+                        )[:200]
+                    if _looks_like_timeout(card_reason) or attempt >= (
+                        _RENDER_TRANSIENT_RETRY
+                    ):
+                        break
+                    await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+                    continue
+                raw_bytes = len(candidate) * 3 // 4
+                if raw_bytes > _PAGE_IMAGE_HARD_LIMIT_BYTES:
+                    self.ctx.logger.warning(
+                        "[搬石] 卡片长图 %.1f MB 超过 RPC 帧上限 %.1f MB，这帖跳过",
+                        raw_bytes / 1048576.0,
+                        _PAGE_IMAGE_HARD_LIMIT_BYTES / 1048576.0,
+                    )
+                    card_reason = "体积超限"
                     break
-                if not image_b64:
-                    break
-                raw_bytes = len(image_b64) * 3 // 4
-                if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
-                    break
-                self.ctx.logger.warning(
-                    "[搬石] 卡片长图 %.1f MB 超过单张上限，降档重渲：%sx",
-                    raw_bytes / 1048576.0,
-                    scale,
-                )
-                image_b64 = ""
+                image_b64 = candidate
+                break
             if not image_b64:
                 # 见上：渲不出来就跳过这帖，不补任何文字。
                 self.ctx.logger.warning(
@@ -2259,26 +2306,119 @@ class StonePlugin(MaiBotPlugin):
             paths.append(self._save_page_image(image_b64))
         return images, paths
 
-    async def _render_page(self, html: str) -> str:
+    async def _localize_page(self, html: str) -> str:
+        """把整页 HTML 的外链全部收掉，变成零外链页面。
+
+        为什么非做不可：宿主的网络路由回调是
+        ``functools.partial(self._handle_network_route, allow_network=...)``，而
+        playwright <=1.60 的 ``wrap_handler`` 把 ``allow_network`` 也算进位置参数
+        个数，于是**每一个**外链请求都抛 ``TypeError: got multiple values for
+        argument 'allow_network'``。请求全部悬空 -> ``load`` 永不触发 -> 一路等到
+        超时 -> 一张图都没有。贴吧原页面有八十多个外链，必炸。
+
+        零外链化之后页面一个请求都不发，那个回调一次都不会被调用，缺陷就绕开了。
+        在 1.61 以上也不亏：实测同一帖原始版 load 要 0.95~2.27 秒、零外链版只要
+        0.09~0.22 秒，出图字节差 0.3%，代价只是多花 0.8~1.6 秒预下载装饰图 ——
+        而这笔下载本来也要发生，只是从浏览器挪到了插件里。
+
+        下不动、超单图上限、超总预算的图一律换成 1x1 透明占位：**宁可少一个装饰图，
+        也要让页面渲出来**。长图渲不出来整帖就没了，缺一个图标没人看得出来。
+        """
+        client = self._client
+        if client is None or not html:
+            return html
+        styles_wanted, images_wanted = page_asset_urls(html)
+        if not styles_wanted and not images_wanted:
+            return html
+        started = time.monotonic()
+        sem = asyncio.Semaphore(_PAGE_ASSET_CONCURRENCY)
+
+        async def _one(url: str, limit: int) -> tuple[str, bytes]:
+            async with sem:
+                try:
+                    body = await client.fetch_asset(url, max_bytes=limit)
+                except StoneBlockedError:
+                    return url, b""
+                except Exception as exc:  # noqa: BLE001
+                    self.ctx.logger.debug("[搬石] 取页面资源失败 %s：%s", url, exc)
+                    return url, b""
+            return url, (body or b"")
+
+        styles: dict[str, str] = {}
+        if styles_wanted:
+            got = await asyncio.gather(
+                *(_one(u, _PAGE_CSS_MAX_BYTES) for u in styles_wanted)
+            )
+            for url, body in got:
+                if body:
+                    styles[url] = body.decode("utf-8", "ignore")
+        images: dict[str, str] = {}
+        used = 0
+        if images_wanted:
+            got = await asyncio.gather(
+                *(_one(u, _PAGE_ASSET_MAX_BYTES) for u in images_wanted)
+            )
+            for url, body in got:
+                if not body:
+                    continue
+                if used + len(body) > _PAGE_ASSET_BUDGET_BYTES:
+                    continue
+                used += len(body)
+                images[url] = "data:%s;base64,%s" % (
+                    _mime_of_image(body),
+                    base64.b64encode(body).decode("ascii"),
+                )
+        out = zero_net_html(html, styles=styles, images=images)
+        self.ctx.logger.debug(
+            "[搬石] 零外链化：样式 %d/%d 个 %.0f KB，图 %d/%d 个 %.0f KB，耗时 %.2fs，"
+            "HTML %.2f MB",
+            len(styles),
+            len(styles_wanted),
+            sum(len(v) for v in styles.values()) / 1024.0,
+            len(images),
+            len(images_wanted),
+            used / 1024.0,
+            time.monotonic() - started,
+            len(out) / 1048576.0,
+        )
+        return out
+
+    async def _render_page(self, html: str, mode: str = _PAGE_RENDER_ZERO) -> str:
         """把整页 HTML 交给宿主渲染器截成一张长图；失败返回空串。
 
-        这条路径必须开 allow_network：页面样式表和图标都在 CDN 上，宿主渲染器默认断网。
+        ``mode`` 是配置项 ``send.page_render``：
 
-        渲染完还要**看体积**。长图是一张要过 RPC 的图片，而图片在帧里 base64 存两份，
-        原文件上限只有 6.000 MiB；贴吧原页面又长又花，高倍缩放出来的 PNG 轻易就 8~12MB。
-        超限的话 ``ctx.send.image`` 会抛异常，用户那边一张图都看不到，而插件只是记一行
-        日志 —— 等于白搬。所以大了就降档重渲（缩放越小体积越小，代价是字更糊），
-        几档都还不行就放弃这张长图。
+        * ``零外链``（默认）——页面先经 :meth:`_localize_page` 收成零外链（样式表内联、
+          装饰图转 data:、盖 CSP），真正交给宿主的 HTML 一个请求都不发。这既是绕开
+          playwright <=1.60 那个路由回调缺陷的唯一办法，在 1.61 以上也更快。
+        * ``原生``——原始页面直接交给宿主浏览器，让它自己加载外链。只有 playwright
+          >=1.61 才正常；<=1.60 会因为同一个缺陷每个请求都报错、最后超时。这条留着
+          是给「想省掉那 0.8~1 秒预下载、且确认自己主程序够新」的人用的。
 
-        **只有「渲出来了但太大」才降档重试**。渲染本身失败（超时、浏览器崩、参数被拒）
-        时降档救不了它 —— 缩放只影响出图体积，不影响页面能不能 load 完，同样的等待
-        再来一遍只是把白等翻倍。这条区别以前没分清，一个必然超时的帖会老老实实把两档
-        都等满，一轮四帖就是八次满额超时，用户看到的就是「搬了十分钟还在搬」。
+        **倍率固定，不降档。** 以前这里有一圈「渲出来太大就降档重渲」的循环，
+        它建立在两个错误前提上：
 
-        但「渲染失败」里还得分两类，不能一律放弃：**超时**是真的等不到，原样重来只是
-        再白等一个超时（云端出网才 3Mbps，慢网是常态，等不到就是等不到）；而浏览器刚
-        崩、RPC 抖一下这类**瞬时故障**，宿主会在失败路径里 reset 掉浏览器实例，隔几秒
-        重试一次往往就能过。所以同一档上给瞬时故障一次重试机会，超时不重试。
+        1. 以为长图要 base64 进帧、单张上限 6 MiB。实际上长图发送走的是
+           **本地路径**（:meth:`_send_page_image` 的 ``custom("imageurl", {"file": …})``），
+           帧里只有几百字节的字符串，发送侧根本没有体积上限。
+        2. 以为 Chromium 全页截图有位图高度上限。实测 20000 px 的页面照样截得出来
+           （414×20000 的 PNG 正常产出），高度也不是限制。
+
+        真正存在的上限只有一条：渲染结果从宿主回插件的那一次 RPC，宿主
+        ``transport/base.py`` 的 ``MAX_FRAME_SIZE`` 是 16 MiB，而结果里放的是
+        base64（膨胀 4/3），于是**原图约 12 MB 是硬顶**，超了宿主直接抛 ValueError。
+        按 ``max_floors`` 的上限 60 层估，最坏也就 3~4 MB，这条兜底实际上永远碰不到；
+        留着它只是为了「万一撞上，别静默丢帖」。
+
+        降档为什么删掉：降档是**再渲一遍**，总时间只会更长。实测倍率对时间的影响
+        微乎其微（页高 7000 时 1.5x 合计 0.344s、1.0x 0.193s，只差 0.15s），而一整轮
+        真实耗时 1.7~2.4 秒里，零外链化下载就占 0.8~1.07 秒 —— 真正慢的是网络，
+        倍率省下的那点时间淹没在噪声里，却要拿一张肉眼可见更糊的图去换。
+
+        **渲染失败里要分两类**：**超时**是真的等不到，原样重来只是再白等一个超时
+        （云端出网才 3Mbps，慢网是常态，等不到就是等不到）；而浏览器刚崩、RPC 抖
+        一下这类**瞬时故障**，宿主会在失败路径里 reset 掉浏览器实例，隔几秒重试一次
+        往往就能过。所以给瞬时故障一次重试机会，超时不重试。
 
         另外**不能走 ``ctx.render.html2png``**。SDK 那个包装不收 ``timeout_ms``，RPC 侧
         一律按默认的 30 秒算（``runner/rpc_client.py``），而 ``render_timeout_ms`` 只传给
@@ -2288,72 +2428,75 @@ class StonePlugin(MaiBotPlugin):
         ``call_host_method`` 把 RPC 超时也按渲染超时给足（这个私有通道不可用时退回
         ``ctx.render.html2png``，见 :meth:`_call_render_capability`）。
         """
-        too_big = 0
+        # 零外链模式下先变成零外链页面：宿主那个网络路由回调在 playwright <=1.60 上
+        # 必炸，页面只要发一个请求就一路等到超时（详见 :meth:`_localize_page`）。
+        # 原生模式跳过这一步，就是把原始页面直接交给浏览器。
+        allow_network = mode == _PAGE_RENDER_RAW
+        if not allow_network:
+            html = await self._localize_page(html)
+        scale = _PAGE_RENDER_SCALE
         last_reason = ""
-        for scale in _PAGE_RENDER_SCALES:
-            image_b64 = ""
-            # 内层是「同一档重试」，只对瞬时故障生效；外层才是「降档」，只对体积超标生效。
-            for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
-                started = time.monotonic()
-                try:
-                    result = await self._render_html2png(html, scale, _PAGE_RENDER_TIMEOUT_MS)
-                except Exception as exc:  # noqa: BLE001
-                    last_reason = "%s: %s" % (type(exc).__name__, exc)
-                    self.ctx.logger.warning(
-                        "[搬石] 原页面渲染抛异常（缩放 %s，第 %d 次）：%s",
-                        scale,
-                        attempt + 1,
-                        exc,
-                    )
-                    if _looks_like_timeout(last_reason) or attempt >= _RENDER_TRANSIENT_RETRY:
-                        break
-                    await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
-                    continue
-                elapsed = time.monotonic() - started
-                if isinstance(result, dict):
-                    image_b64 = str(result.get("image_base64") or "")
-                if image_b64:
-                    break
-                # 宿主没抛异常却没给图，说明它自己判失败了（超时/浏览器挂了/参数被拒）。
-                # 以前的实现直接 continue，日志里只留下一句「降档后仍然太大」—— 明明一张图
-                # 都没渲出来，却报「太大」，把排查方向带偏。这里把宿主的原话记下来。
-                detail = ""
-                if isinstance(result, dict):
-                    detail = str(result.get("error") or result.get("message") or result)[:200]
-                else:
-                    detail = type(result).__name__ if result is not None else "None"
-                last_reason = "%.1fs 无图 (%s)" % (elapsed, detail)
-                self.ctx.logger.warning(
-                    "[搬石] 原页面渲染没拿到图（缩放 %s，耗时 %.1fs）：%s",
-                    scale,
-                    elapsed,
-                    detail,
+        for attempt in range(_RENDER_TRANSIENT_RETRY + 1):
+            started = time.monotonic()
+            try:
+                result = await self._render_html2png(
+                    html, scale, _PAGE_RENDER_TIMEOUT_MS, allow_network=allow_network
                 )
-                if _looks_like_timeout(detail) or attempt >= _RENDER_TRANSIENT_RETRY:
+            except Exception as exc:  # noqa: BLE001
+                last_reason = "%s: %s" % (type(exc).__name__, exc)
+                self.ctx.logger.warning(
+                    "[搬石] 原页面渲染抛异常（第 %d 次）：%s", attempt + 1, exc
+                )
+                if _looks_like_timeout(last_reason) or attempt >= _RENDER_TRANSIENT_RETRY:
                     break
                 await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
-            if not image_b64:
-                # 渲染本身失败：降档救不了它（缩放只影响出图体积，不影响页面能不能
-                # load 完），再赔一整个超时进去没有意义。这帖交回去下轮重试。
-                break
-            # base64 长度反推原始字节：base64 是 4 个字符存 3 字节。
-            raw_bytes = len(image_b64) * 3 // 4
-            if raw_bytes <= _PAGE_IMAGE_SOFT_LIMIT_BYTES:
+                continue
+            elapsed = time.monotonic() - started
+            image_b64 = ""
+            if isinstance(result, dict):
+                image_b64 = str(result.get("image_base64") or "")
+            if image_b64:
+                # base64 长度反推原始字节：base64 是 4 个字符存 3 字节。
+                raw_bytes = len(image_b64) * 3 // 4
+                if raw_bytes > _PAGE_IMAGE_HARD_LIMIT_BYTES:
+                    # 12 MB 硬顶：再往下发就是宿主 RPC 抛 ValueError。按正常层数
+                    # 碰不到这里（60 层最坏 3~4 MB），真撞上了只能放弃这帖。
+                    self.ctx.logger.warning(
+                        "[搬石] 原页面长图 %.1f MB 超过 RPC 帧上限 %.1f MB，这帖跳过",
+                        raw_bytes / 1048576.0,
+                        _PAGE_IMAGE_HARD_LIMIT_BYTES / 1048576.0,
+                    )
+                    return ""
+                width = int(result.get("width") or 0)
+                height = int(result.get("height") or 0)
+                self.ctx.logger.info(
+                    "[搬石] 原页面长图 %.2f MB（%sx，%dx%d，渲染 %.1fs）",
+                    raw_bytes / 1048576.0,
+                    scale,
+                    width,
+                    height,
+                    elapsed,
+                )
                 return image_b64
-            too_big += 1
+            # 宿主没抛异常却没给图，说明它自己判失败了（超时/浏览器挂了/参数被拒）。
+            # 以前的实现直接 continue，日志里只留下一句「降档后仍然太大」—— 明明一张图
+            # 都没渲出来，却报「太大」，把排查方向带偏。这里把宿主的原话记下来。
+            detail = ""
+            if isinstance(result, dict):
+                detail = str(result.get("error") or result.get("message") or result)[:200]
+            else:
+                detail = type(result).__name__ if result is not None else "None"
+            last_reason = "%.1fs 无图 (%s)" % (elapsed, detail)
             self.ctx.logger.warning(
-                "[搬石] 原页面长图 %.1f MB 超过单张上限 %.1f MB，降档重渲：%sx",
-                raw_bytes / 1048576.0,
-                _PAGE_IMAGE_SOFT_LIMIT_BYTES / 1048576.0,
-                scale,
+                "[搬石] 原页面渲染没拿到图（耗时 %.1fs）：%s", elapsed, detail
             )
-        if too_big:
-            self.ctx.logger.warning("[搬石] 原页面长图降档后仍然太大，这帖跳过")
-        else:
-            self.ctx.logger.warning(
-                "[搬石] 原页面长图没渲出来（%s），这帖跳过",
-                last_reason or "未知",
-            )
+            if _looks_like_timeout(detail) or attempt >= _RENDER_TRANSIENT_RETRY:
+                break
+            await asyncio.sleep(_RENDER_RETRY_PAUSE_S)
+        self.ctx.logger.warning(
+            "[搬石] 原页面长图没渲出来（%s），这帖跳过",
+            last_reason or "未知",
+        )
         return ""
 
     async def _call_render_capability(self, payload: dict[str, Any], timeout_ms: int) -> Any:
@@ -2408,12 +2551,17 @@ class StonePlugin(MaiBotPlugin):
             payload, _CARD_RENDER_TIMEOUT_MS + _RENDER_RPC_SLACK_MS
         )
 
-    async def _render_html2png(self, html: str, scale: float, timeout_ms: int) -> Any:
+    async def _render_html2png(
+        self, html: str, scale: float, timeout_ms: int, *, allow_network: bool = True
+    ) -> Any:
         """渲染 HTML，并且让 RPC 超时跟着渲染超时走（默认 30 秒根本不够）。
 
         ``ctx.render.html2png`` 是 SDK 的薄包装，参数里没有 ``timeout_ms``，于是不管
         你 ``render_timeout_ms`` 传多大，RPC 层都只等 30 秒。直接调 ``cap.call`` 才能
         把超时传下去。``cap.call`` 在 SDK 的 ``_ALLOWED_RAW_HOST_METHODS`` 里，合规。
+
+        ``allow_network`` 跟着配置项 ``send.page_render`` 走：零外链模式下页面里本来
+        就没有请求了，传 False 让宿主连路由回调都不挂；原生模式必须 True。
         """
         payload = {
             "capability": "render.html2png",
@@ -2431,7 +2579,7 @@ class StonePlugin(MaiBotPlugin):
                 "wait_for_selector": "",
                 "wait_for_timeout_ms": 0,
                 "render_timeout_ms": timeout_ms,
-                "allow_network": True,
+                "allow_network": bool(allow_network),
             },
         }
         # 插件自己再多等一会儿：宿主判超时会先返回错误，这里只是兜住 RPC 层，

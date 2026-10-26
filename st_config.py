@@ -46,7 +46,7 @@ class PluginSection(PluginConfigBase):
         },
     )
     config_version: str = Field(
-        default="1.1.6",
+        default="1.1.7",
         description="配置版本号，请勿手动修改",
         json_schema_extra={"label": "配置版本", "hidden": True},
     )
@@ -257,6 +257,16 @@ class SendSection(PluginConfigBase):
         json_schema_extra={
             "label": "长图样式",
             "hint": "贴吧原页面 = 按手机版页面截图；自绘卡片 = 插件自己排版",
+            "x-widget": "select",
+        },
+    )
+    page_render: Literal["零外链", "原生"] = Field(
+        default="零外链",
+        description="贴吧原页面的渲染方式",
+        json_schema_extra={
+            "label": "原页面渲染方式",
+            "hint": "零外链 = 先内嵌好资源再渲染，任何主程序版本都能出图；"
+            "原生 = 浏览器自己加载外链，要 1.61 以上",
             "x-widget": "select",
         },
     )

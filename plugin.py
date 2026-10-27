@@ -1448,9 +1448,13 @@ class StonePlugin(MaiBotPlugin):
         elif not collected:
             summary = "本轮没有新帖可搬（要么都搬过了，要么没够门槛）"
         else:
-            # 「挑了几条」和「真发出去几条」是两回事。全部长图都没渲出来的那一轮，
+            # 「挑了几条」和「真发出去几条」是两回事。一条都没发出去的那一轮，
             # 挑的条数是 4、发出去的是 0，日志要是只写前者，看日志的人会以为一切正常，
             # 而群里其实什么也没有（这就是本轮云端踩的坑）。所以这里两条都写出来。
+            #
+            # 措辞只说到「没发出去」，不猜原因：以前这里写死「长图都没渲出来」，
+            # 而实际是聊天记录被协议端拒收（长图明明都渲好了）—— 一句猜错的
+            # 原因比不说更糟，会把排查引到完全错误的方向上。
             summary = "本轮挑了 %d 条" % len(collected)
             if landed_posts:
                 summary = "本轮搬了 %d 条" % landed_posts
@@ -1459,7 +1463,7 @@ class StonePlugin(MaiBotPlugin):
                         len(collected) - landed_posts
                     )
             else:
-                summary += "，但一条也没发出去（长图都没渲出来）"
+                summary += "，但一条也没发出去（原因见上面的日志）"
                 is_error = True
             if delivered:
                 # 说「群」而不是「会话」：这两个数以前是同一个，直到发现同一个群
@@ -2048,7 +2052,8 @@ class StonePlugin(MaiBotPlugin):
                 # 这几帖不记账（交回去让 _run_locked 排除），下一轮会自动重来，
                 # 所以不会永久丢帖。
                 self.ctx.logger.warning(
-                    "[搬石] 聊天记录没发出去，这 %d 条不单独补发，下一轮重搬",
+                    "[搬石] 聊天记录没发出去，这 %d 条不单独补发，下一轮重搬"
+                    "（协议端为什么拒收，看主程序日志里的 SendService 行）",
                     len(collected),
                 )
                 return list(collected)
@@ -2728,7 +2733,8 @@ class StonePlugin(MaiBotPlugin):
                 )
             # 长图之外不再往节点里塞逐层的文字和插图：那种节点在聊天记录里
             # 就是刷屏，而且长图已经把正文和插图都带上了。这里只挂视频。
-            self._attach_videos(nodes, first, detail, payload)
+            # 视频各自单独成节点，所以它占的字节也要记进预算。
+            used_bytes += self._attach_videos(nodes, first, detail, payload)
             # 预算见底，再往后只会更糟：停在这里，剩下的帖子交回去。
             # 不能就这么算了 —— 这条聊天记录待会儿照样发得出去、`sent` 会是
             # True，没有任何地方会发现内容被截掉了；把它们记成「已搬过」就再也
@@ -2748,11 +2754,35 @@ class StonePlugin(MaiBotPlugin):
         first: int,
         detail: Any,
         payload: dict[str, Any],
-    ) -> None:
-        """把这一帖的视频挂到它最后一个转发节点的末尾，让视频留在聊天记录里。"""
+    ) -> int:
+        """把这一帖的视频放进聊天记录，**每个视频独占一个节点**。
+
+        视频段不能和文字、图片待在同一节点里。SnowLuma 网关对合并转发里的
+        视频只认「独占一条消息」，同一节点里还有别的段它就整条拒收：
+
+            对端动作返回失败: action=send_private_forward_msg
+            message=message element "video" must be the only segment in a message
+
+        而被拒的是**整条聊天记录**（宿主把整条转发当成一次发送），不是那一个
+        节点 —— 群里一条都收不到，报错却只提到 video，极难从日志上看出来。
+        所以视频一律单独开节点，一个视频一个节点。
+
+        返回这些节点占掉的帧字节数，交给调用方记账。
+        """
         segments = self._video_segments(detail, payload)
-        if segments and len(nodes) > first:
-            nodes[-1]["segments"].extend(segments)
+        if not segments or len(nodes) <= first:
+            return 0
+        cost = 0
+        for segment in segments:
+            nodes.append(
+                {
+                    "nickname": self._forward_name(),
+                    "user_id": "",
+                    "segments": [segment],
+                }
+            )
+            cost += _PATH_SEGMENT_COST + _FORWARD_NODE_OVERHEAD
+        return cost
 
     def _video_segments(self, detail: Any, payload: dict[str, Any]) -> list[dict[str, Any]]:
         """构造合并转发节点里的视频消息段（走 URL，不用 base64）。
